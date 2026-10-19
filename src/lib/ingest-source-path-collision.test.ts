@@ -7,6 +7,7 @@ import { useChatStore } from "@/stores/chat-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { sourceSummarySlugFromIdentity } from "./source-identity"
+import { migrateSourcePath } from "./source-lifecycle"
 
 vi.mock("@/commands/fs", () => realFs)
 
@@ -14,7 +15,13 @@ let sourceMarkers: string[] = []
 let failLongChunksOnce = new Set<number>()
 let extraReviewResponse = ""
 let generationSuffix = ""
+let truncatedRepairResponse = ""
 let abortDuringReview: AbortController | null = null
+let interactiveGenerationOverride = ""
+let mergeRequestCount = 0
+let truncateGenerationOnce = false
+let emptyGenerationOnce = false
+let confirmResumeCompleteOnce = false
 
 vi.mock("./llm-client", () => ({
   streamChat: vi.fn(async (_cfg, messages, cb) => {
@@ -22,6 +29,7 @@ vi.mock("./llm-client", () => ({
     const userPrompt = String(messages?.[1]?.content ?? "")
 
     if (systemPrompt.startsWith("You are merging two versions")) {
+      mergeRequestCount++
       const incoming = userPrompt.split("## Newly generated version")[1]?.split("---")[2]
       cb.onToken(incoming?.trim() || "---\ntitle: merged\n---\n\n# merged")
       cb.onDone()
@@ -29,6 +37,11 @@ vi.mock("./llm-client", () => ({
     }
 
     if (systemPrompt.startsWith("You are a wiki generation assistant")) {
+      if (interactiveGenerationOverride) {
+        cb.onToken(interactiveGenerationOverride)
+        cb.onDone()
+        return
+      }
       cb.onToken([
         "---FILE: wiki/sources/config.md---",
         "---",
@@ -78,12 +91,30 @@ vi.mock("./llm-client", () => ({
       return
     }
 
+    if (systemPrompt.startsWith("You are repairing truncated wiki FILE blocks")) {
+      cb.onToken(truncatedRepairResponse)
+      cb.onDone()
+      return
+    }
+
     const targetMatch = systemPrompt.match(
       /source summary page at \*\*(wiki\/sources\/[^*]+)\*\*/,
     )
     if (!targetMatch) {
       cb.onToken("## Analysis\nConfiguration source.")
       cb.onDone()
+      return
+    }
+
+    if (emptyGenerationOnce) {
+      emptyGenerationOnce = false
+      cb.onDone({ finishReason: "stop", truncated: false })
+      return
+    }
+    if (confirmResumeCompleteOnce) {
+      confirmResumeCompleteOnce = false
+      cb.onToken("---RESUME COMPLETE---")
+      cb.onDone({ finishReason: "stop", truncated: false })
       return
     }
 
@@ -104,14 +135,31 @@ vi.mock("./llm-client", () => ({
       "---END FILE---",
       generationSuffix,
     ].join("\n"))
-    cb.onDone()
+    if (truncateGenerationOnce) {
+      truncateGenerationOnce = false
+      cb.onDone({ finishReason: "length", truncated: true })
+    } else {
+      cb.onDone({ finishReason: "stop", truncated: false })
+    }
   }),
 }))
 
-import { autoIngest, executeIngestWrites } from "./ingest"
+vi.mock("./mineru", () => ({
+  parseWithMineru: vi.fn(),
+  parseWithMineruResult: vi.fn(),
+}))
+
+import {
+  autoIngest,
+  buildFallbackSourceSummary,
+  executeIngestWrites,
+  hasMineruImageRefs,
+} from "./ingest"
 import { streamChat } from "./llm-client"
+import { parseWithMineruResult } from "./mineru"
 
 const mockStreamChat = vi.mocked(streamChat)
+const mockParseWithMineru = vi.mocked(parseWithMineruResult)
 
 describe("autoIngest source summary paths", () => {
   let tmp: { path: string; cleanup: () => Promise<void> } | undefined
@@ -121,14 +169,21 @@ describe("autoIngest source summary paths", () => {
     failLongChunksOnce = new Set()
     extraReviewResponse = ""
     generationSuffix = ""
+    truncatedRepairResponse = ""
     abortDuringReview = null
+    interactiveGenerationOverride = ""
+    mergeRequestCount = 0
+    truncateGenerationOnce = false
+    emptyGenerationOnce = false
+    confirmResumeCompleteOnce = false
     mockStreamChat.mockClear()
+    mockParseWithMineru.mockReset()
     tmp = await createTempProject("same-basename-sources")
 
     await writeFileRaw(`${tmp.path}/purpose.md`, "# Purpose\n\nTrack project config files.\n")
     await writeFileRaw(
       `${tmp.path}/schema.md`,
-      "# Schema\n\nEach source needs its own source summary page.\n",
+      "# Schema\n\nEach source needs its own source summary page.\n\n## Page Types\n| goal | wiki/goals/ | Outcomes |\n| habit | wiki/habits/ | Behaviours |",
     )
     await writeFileRaw(`${tmp.path}/wiki/index.md`, "# Index\n")
     await writeFileRaw(`${tmp.path}/wiki/overview.md`, "# Overview\n")
@@ -170,12 +225,40 @@ describe("autoIngest source summary paths", () => {
         apiKey: "",
         model: "",
       },
+      mineruConfig: {
+        enabled: false,
+        backend: "cloud",
+        token: "",
+        modelVersion: "vlm",
+      },
     })
   })
 
   afterEach(async () => {
     await tmp?.cleanup()
     tmp = undefined
+  })
+
+  it("detects MinerU image refs with URL-encoded source summary slugs", () => {
+    expect(hasMineruImageRefs(
+      "![chart](media/%E6%B1%A1%E6%B0%B4%20paper/mineru/images/chart%281%29.png)",
+      "污水 paper",
+    )).toBe(true)
+    expect(hasMineruImageRefs(
+      "![chart](media/污水 paper/mineru/images/chart.png)",
+      "污水 paper",
+    )).toBe(true)
+    expect(hasMineruImageRefs(
+      "![chart](media/other/mineru/images/chart.png)",
+      "污水 paper",
+    )).toBe(false)
+  })
+
+  it("preserves complete analysis in a fallback source summary", () => {
+    const analysis = `begin-${"x".repeat(5000)}-end`
+    const content = buildFallbackSourceSummary("long.md", analysis, "2026-07-11")
+    expect(content).toContain(analysis)
+    expect(content).toContain("-end")
   })
 
   it("keeps distinct source summaries for same-basename files in different source subdirectories", async () => {
@@ -209,6 +292,110 @@ describe("autoIngest source summary paths", () => {
     expect(summaryFiles).toHaveLength(2)
     expect(allSummaries).toContain("project-a/config.yaml")
     expect(allSummaries).toContain("project-b/config.yaml")
+  })
+
+  it("replaces stale content when a corrected source solely owns the page", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const sourcePath = `${tmp.path}/raw/sources/project-a/config.yaml`
+    sourceMarkers = ["obsolete wording"]
+    await autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)
+
+    await writeFileRaw(sourcePath, "name: corrected\n")
+    sourceMarkers = ["corrected wording"]
+    await autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)
+
+    const summaryPath = `${tmp.path}/wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
+    const content = await fs.readFile(summaryPath, "utf8")
+    expect(content).toContain("corrected wording")
+    expect(content).not.toContain("obsolete wording")
+    expect(mergeRequestCount).toBe(0)
+  })
+
+  it("moves the canonical source summary and its source reference", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["movable summary"]
+    const oldSource = `${tmp.path}/raw/sources/project-a/config.yaml`
+    await autoIngest(tmp.path, oldSource, useWikiStore.getState().llmConfig)
+
+    const oldIdentity = "project-a/config.yaml"
+    const newIdentity = "archive/config.yaml"
+    const oldSummary = `${tmp.path}/wiki/sources/${sourceSummarySlugFromIdentity(oldIdentity)}.md`
+    const newSummary = `${tmp.path}/wiki/sources/${sourceSummarySlugFromIdentity(newIdentity)}.md`
+    await migrateSourcePath(
+      tmp.path,
+      "raw/sources/project-a/config.yaml",
+      "raw/sources/archive/config.yaml",
+    )
+
+    await expect(fs.access(oldSummary)).rejects.toThrow()
+    const content = await fs.readFile(newSummary, "utf8")
+    expect(content).toContain('sources: ["archive/config.yaml"]')
+  })
+
+  it("migrates source references for a case-only rename", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const pagePath = `${tmp.path}/wiki/entities/case.md`
+    await writeFileRaw(pagePath, [
+      "---",
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "# Case",
+    ].join("\n"))
+
+    await migrateSourcePath(
+      tmp.path,
+      "raw/sources/project-a/config.yaml",
+      "raw/sources/Project-A/config.yaml",
+    )
+
+    expect(await fs.readFile(pagePath, "utf8")).toContain(
+      'sources: ["Project-A/config.yaml"]',
+    )
+  })
+
+  it("migrates a unique legacy basename source reference", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    // Remove the second same-basename source so the legacy shorthand is
+    // unambiguous after the move.
+    await fs.rm(`${tmp.path}/raw/sources/project-b/config.yaml`)
+    const pagePath = `${tmp.path}/wiki/entities/legacy.md`
+    await writeFileRaw(pagePath, [
+      "---",
+      'sources: ["config.yaml"]',
+      "---",
+      "# Legacy",
+    ].join("\n"))
+
+    await migrateSourcePath(
+      tmp.path,
+      "raw/sources/project-a/config.yaml",
+      "raw/sources/archive/config.yaml",
+    )
+
+    expect(await fs.readFile(pagePath, "utf8")).toContain(
+      'sources: ["archive/config.yaml"]',
+    )
+  })
+
+  it("does not rewrite an ambiguous legacy basename source reference", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const pagePath = `${tmp.path}/wiki/entities/ambiguous.md`
+    await writeFileRaw(pagePath, [
+      "---",
+      'sources: ["config.yaml"]',
+      "---",
+      "# Ambiguous",
+    ].join("\n"))
+
+    await migrateSourcePath(
+      tmp.path,
+      "raw/sources/project-a/config.yaml",
+      "raw/sources/archive/config.yaml",
+    )
+
+    expect(await fs.readFile(pagePath, "utf8")).toContain(
+      'sources: ["config.yaml"]',
+    )
   })
 
   it("migrates a safe legacy basename source summary to the canonical nested source path", async () => {
@@ -313,6 +500,10 @@ describe("autoIngest source summary paths", () => {
       String(messages?.[0]?.content ?? "").startsWith("You are analyzing a long source document"),
     )
     expect(chunkCalls.length).toBeGreaterThan(1)
+    const chunkSystemPrompt = String(chunkCalls[0][1]?.[0]?.content ?? "")
+    expect(chunkSystemPrompt).toContain("wiki/goals/")
+    expect(chunkSystemPrompt).toContain("Schema-Typed Candidates")
+    expect(chunkSystemPrompt).toContain("never invent goals")
     expect(String(chunkCalls[0][1]?.[1]?.content ?? "")).toContain("## MAIN CHUNK TO ANALYZE")
     expect(String(chunkCalls[1][1]?.[1]?.content ?? "")).toContain(
       "Digest after chunk 1: stable context 1.",
@@ -465,6 +656,166 @@ describe("autoIngest source summary paths", () => {
     expect(reviews[0].description).not.toContain("Truncated Orphan")
   })
 
+  it("retries a truncated FILE block with a targeted generation request", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["project-a config"]
+    generationSuffix = [
+      "",
+      "---FILE: wiki/concepts/recovered.md---",
+      "---",
+      'title: "Recovered concept"',
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "",
+      "# Recovered concept",
+      "",
+      "This response was cut off",
+    ].join("\n")
+    truncatedRepairResponse = [
+      "---FILE: wiki/concepts/recovered.md---",
+      "---",
+      'title: "Recovered concept"',
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "",
+      "# Recovered concept",
+      "",
+      "This block was regenerated completely.",
+      "---END FILE---",
+      "",
+      "---FILE: wiki/concepts/stray.md---",
+      "# Stray concept",
+      "---END FILE---",
+    ].join("\n")
+
+    const written = await autoIngest(
+      tmp.path,
+      `${tmp.path}/raw/sources/project-a/config.yaml`,
+      useWikiStore.getState().llmConfig,
+      undefined,
+      "project-a",
+    )
+
+    expect(written).toContain("wiki/concepts/recovered.md")
+    await expect(
+      fs.readFile(`${tmp.path}/wiki/concepts/recovered.md`, "utf8"),
+    ).resolves.toContain("This block was regenerated completely.")
+    expect(written).not.toContain("wiki/concepts/stray.md")
+    await expect(
+      fs.readFile(`${tmp.path}/wiki/concepts/stray.md`, "utf8"),
+    ).rejects.toThrow()
+    expect(
+      mockStreamChat.mock.calls.some(([, messages]) =>
+        String(messages[0]?.content ?? "").startsWith(
+          "You are repairing truncated wiki FILE blocks",
+        ),
+      ),
+    ).toBe(true)
+  })
+
+  it("auto-routes a generated typed page into its schema directory", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["project-a config"]
+    generationSuffix = [
+      "",
+      "---FILE: wiki/concepts/outcome.md---",
+      "---",
+      "type: goal",
+      'title: "Outcome"',
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "# Outcome",
+      "---END FILE---",
+    ].join("\n")
+
+    const written = await autoIngest(
+      tmp.path,
+      `${tmp.path}/raw/sources/project-a/config.yaml`,
+      useWikiStore.getState().llmConfig,
+    )
+
+    expect(written).toContain("wiki/goals/outcome.md")
+    expect(written).not.toContain("wiki/concepts/outcome.md")
+    await expect(fs.readFile(`${tmp.path}/wiki/goals/outcome.md`, "utf8"))
+      .resolves.toContain("# Outcome")
+  })
+
+  it("persists completed files and resumes after a truncated generation", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const sourcePath = `${tmp.path}/raw/sources/project-a/config.yaml`
+    sourceMarkers = ["first attempt", "resumed attempt"]
+    generationSuffix = [
+      "",
+      "---FILE: wiki/goals/preserved.md---",
+      "---",
+      "type: goal",
+      'title: "Preserved"',
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "# Preserved",
+      "---END FILE---",
+    ].join("\n")
+    truncateGenerationOnce = true
+
+    await expect(autoIngest(
+      tmp.path,
+      sourcePath,
+      useWikiStore.getState().llmConfig,
+    )).rejects.toThrow("generation reached its output limit")
+    await expect(fs.readFile(`${tmp.path}/wiki/goals/preserved.md`, "utf8"))
+      .resolves.toContain("# Preserved")
+
+    emptyGenerationOnce = true
+    await expect(autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig))
+      .rejects.toThrow("resume returned no complete wiki file")
+    await expect(fs.readdir(`${tmp.path}/.llm-wiki/ingest-generation`))
+      .resolves.toHaveLength(1)
+
+    confirmResumeCompleteOnce = true
+    await autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)
+
+    const generationCalls = mockStreamChat.mock.calls.filter(([, messages]) =>
+      String(messages[0]?.content ?? "").includes("## What to generate"),
+    )
+    const resumedPrompt = String(generationCalls[generationCalls.length - 1]?.[1]?.[1]?.content ?? "")
+    expect(resumedPrompt)
+      .toContain("## Resume checkpoint")
+    expect(resumedPrompt).toContain("wiki/goals/preserved.md")
+    const checkpointFiles = await fs.readdir(`${tmp.path}/.llm-wiki/ingest-generation`)
+    expect(checkpointFiles).toHaveLength(0)
+  })
+
+  it("rejects an ingest when a truncated FILE block cannot be repaired", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["project-a config"]
+    generationSuffix = [
+      "",
+      "---FILE: wiki/concepts/incomplete.md---",
+      "---",
+      'title: "Incomplete concept"',
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "",
+      "# Incomplete concept",
+      "",
+      "This response was cut off",
+    ].join("\n")
+    truncatedRepairResponse = ""
+
+    await expect(autoIngest(
+      tmp.path,
+      `${tmp.path}/raw/sources/project-a/config.yaml`,
+      useWikiStore.getState().llmConfig,
+      undefined,
+      "project-a",
+    )).rejects.toThrow("Ingest incomplete")
+
+    const activity = useActivityStore.getState().items[0]
+    expect(activity.status).toBe("error")
+    expect(activity.detail).toContain("could not be repaired")
+    expect(activity.detail).toContain("wiki/concepts/incomplete.md")
+  })
+
   it("propagates cancellation that happens during the dedicated review stage", async () => {
     if (!tmp) throw new Error("missing temp project")
     sourceMarkers = ["project-a config"]
@@ -480,7 +831,98 @@ describe("autoIngest source summary paths", () => {
         controller.signal,
         "project-a",
       ),
-    ).rejects.toThrow("AbortError")
+    ).rejects.toThrow("Ingest cancelled")
+  })
+
+  it("falls back to built-in PDF extraction when MinerU fails for a non-cancelled ingest", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["mineru fallback source"]
+    await writeFileRaw(`${tmp.path}/raw/sources/project-a/report.pdf`, "pdf fallback text\n")
+    useWikiStore.setState({
+      mineruConfig: {
+        enabled: true,
+        token: "mineru-token",
+        modelVersion: "vlm",
+      },
+    })
+    mockParseWithMineru.mockRejectedValueOnce(new Error("network failure from MinerU"))
+    const updateSpy = vi.spyOn(useActivityStore.getState(), "updateItem")
+
+    const written = await autoIngest(
+      tmp.path,
+      `${tmp.path}/raw/sources/project-a/report.pdf`,
+      useWikiStore.getState().llmConfig,
+      undefined,
+      "project-a",
+    )
+
+    expect(written.length).toBeGreaterThan(0)
+    expect(mockParseWithMineru).toHaveBeenCalled()
+    expect(
+      updateSpy.mock.calls.some(([, updates]) =>
+        updates.detail?.includes("falling back to built-in PDF extraction"),
+      ),
+    ).toBe(true)
+    updateSpy.mockRestore()
+  })
+
+  it("uses a configured local MinerU backend without a cloud token", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["local mineru source"]
+    await writeFileRaw(`${tmp.path}/raw/sources/project-a/local.pdf`, "pdf fallback text\n")
+    useWikiStore.setState({
+      mineruConfig: {
+        enabled: true,
+        backend: "local",
+        token: "",
+        modelVersion: "vlm",
+      },
+    })
+    mockParseWithMineru.mockResolvedValueOnce({
+      markdown: "local MinerU markdown",
+      savedImages: [],
+    })
+
+    await autoIngest(
+      tmp.path,
+      `${tmp.path}/raw/sources/project-a/local.pdf`,
+      useWikiStore.getState().llmConfig,
+      undefined,
+      "project-a",
+    )
+
+    expect(mockParseWithMineru).toHaveBeenCalled()
+  })
+
+  it("does not fall back to built-in PDF extraction when MinerU is cancelled", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    await writeFileRaw(`${tmp.path}/raw/sources/project-a/cancelled.pdf`, "pdf fallback text\n")
+    useWikiStore.setState({
+      mineruConfig: {
+        enabled: true,
+        token: "mineru-token",
+        modelVersion: "vlm",
+      },
+    })
+    const controller = new AbortController()
+    controller.abort()
+    mockParseWithMineru.mockRejectedValueOnce(new Error("MinerU parsing cancelled"))
+
+    await expect(
+      autoIngest(
+        tmp.path,
+        `${tmp.path}/raw/sources/project-a/cancelled.pdf`,
+        useWikiStore.getState().llmConfig,
+        controller.signal,
+        "project-a",
+      ),
+    ).rejects.toThrow("Ingest cancelled")
+
+    expect(
+      useActivityStore.getState().items.some((item) =>
+        item.detail?.includes("falling back to built-in PDF extraction"),
+      ),
+    ).toBe(false)
   })
 
   it("canonicalizes interactive source summary paths and sources frontmatter", async () => {
@@ -529,5 +971,40 @@ describe("autoIngest source summary paths", () => {
     expect(writtenPaths.map((p) => p.replace(/\\/g, "/"))).toEqual([canonicalSummaryPath])
     await expect(fs.access(staleSummaryPath)).rejects.toThrow()
     expect(content).toContain('sources: ["project-a/config.yaml"]')
+  })
+
+  it("rejects unsafe and application-managed paths from interactive writes", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    interactiveGenerationOverride = [
+      "---FILE: wiki/INDEX.md---\n# hostile index\n---END FILE---",
+      "---FILE: wiki\\overview.MD---\n# hostile overview\n---END FILE---",
+      "---FILE: ../escape.md---\n# escape\n---END FILE---",
+    ].join("\n")
+    useChatStore.setState({ ingestSource: `${tmp.path}/raw/sources/project-a/config.yaml` })
+
+    const written = await executeIngestWrites(tmp.path, useWikiStore.getState().llmConfig)
+
+    expect(written).toEqual([])
+    await expect(fs.access(path.join(tmp.path, "escape.md"))).rejects.toThrow()
+  })
+
+  it("sanitizes malformed citation links in interactive writes", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    interactiveGenerationOverride = [
+      "---FILE: wiki/entities/citations.md---",
+      "---",
+      "type: entity",
+      "title: Citations",
+      "---",
+      "Evidence [[1]] and [[target|label].",
+      "---END FILE---",
+    ].join("\n")
+    useChatStore.setState({ ingestSource: null })
+
+    const written = await executeIngestWrites(tmp.path, useWikiStore.getState().llmConfig)
+
+    expect(written).toHaveLength(1)
+    const content = await fs.readFile(written[0], "utf8")
+    expect(content).toContain("Evidence [1] and [[target|label]].")
   })
 })

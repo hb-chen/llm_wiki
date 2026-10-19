@@ -15,7 +15,8 @@
  *      texted image carries enough semantic load that the model
  *      preserves it through paraphrasing.
  *
- * Cache key = SHA-256 of image bytes. This makes duplicate images
+ * Cache key = SHA-256 of image bytes plus the requested output language.
+ * This makes duplicate images
  * across PDFs (logos, page headers, recurring chart templates) a
  * single LLM call across the whole project — without it, a corpus
  * of slide decks with shared brand assets would caption the same
@@ -23,7 +24,9 @@
  *
  * Cache file lives at
  *   `<project>/.llm-wiki/image-caption-cache.json`
- * keyed `{ "<sha256>": { caption, mimeType, model, capturedAt } }`.
+ * Legacy language-neutral entries remain keyed by SHA-256. Language-aware
+ * entries include the image hash and language in their metadata so changing a
+ * project's output language cannot silently reuse a caption in the old one.
  * The model + capturedAt fields aren't read by anything yet but
  * shipping the metadata now means we can implement Phase 4's
  * "re-caption with new model" without a second cache version.
@@ -38,12 +41,15 @@ import { writeFile, readFile, createDirectory, fileExists, readFileAsBase64 } fr
 import { captionImage } from "@/lib/vision-caption"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { normalizePath } from "@/lib/path-utils"
+import { clampUserConcurrency } from "@/lib/concurrency-limits"
 
 interface CaptionEntry {
   caption: string
   mimeType: string
   model: string
   capturedAt: string
+  imageHash?: string
+  outputLanguage?: string
 }
 
 type CaptionCache = Record<string, CaptionEntry>
@@ -79,13 +85,37 @@ async function sha256OfBase64(b64: string): Promise<string> {
  */
 export async function loadCaptionCache(
   projectPath: string,
+  outputLanguage?: string,
 ): Promise<Map<string, string>> {
   const cache = await readCache(projectPath)
   const out = new Map<string, string>()
-  for (const [hash, entry] of Object.entries(cache)) {
+  const selectedAt = new Map<string, number>()
+  const language = normalizeCaptionLanguage(outputLanguage)
+  for (const [key, entry] of Object.entries(cache)) {
+    const hash = entry.imageHash ?? (/^[a-f0-9]{64}$/i.test(key) ? key : null)
+    if (!hash) continue
+    const entryLanguage = normalizeCaptionLanguage(entry.outputLanguage)
+    if (language && entryLanguage !== language) continue
+    if (!language) {
+      const capturedAt = Date.parse(entry.capturedAt)
+      const timestamp = Number.isFinite(capturedAt) ? capturedAt : 0
+      if ((selectedAt.get(hash) ?? -1) > timestamp) continue
+      selectedAt.set(hash, timestamp)
+    }
     out.set(hash, entry.caption)
   }
   return out
+}
+
+function normalizeCaptionLanguage(outputLanguage?: string): string {
+  const language = outputLanguage?.trim()
+  if (!language || language.toLowerCase() === "auto") return ""
+  return language.normalize("NFKC").toLowerCase()
+}
+
+function captionCacheKey(imageHash: string, outputLanguage?: string): string {
+  const language = normalizeCaptionLanguage(outputLanguage)
+  return language ? `${imageHash}::language:${encodeURIComponent(language)}` : imageHash
 }
 
 async function readCache(projectPath: string): Promise<CaptionCache> {
@@ -131,19 +161,41 @@ async function writeCache(projectPath: string, cache: CaptionCache): Promise<voi
  *     captured but ignored when deciding whether to caption (we
  *     re-caption even non-empty alt because user-typed alt text
  *     usually says "Figure 3" — useless to retrieval).
- *   - HTML `<img src="...">`: NOT captured by this regex; we
+ *   - HTML `<img src="...">`: NOT captured by this parser; we
  *     don't generate those, and re-captioning hand-typed HTML
  *     would surprise the user.
  *   - Reference-style images (`![alt][ref]` + `[ref]: url`): NOT
  *     handled — we don't generate them either. Add support if
  *     it matters.
  */
-const MD_IMAGE_RE = /(!\[)([^\]]*)(\]\()([^)\s]+)(\))/g
+const TRAILING_IMAGE_TITLE_RE = /\s+(?:"[^"]*"|'[^']*')\s*$/
+
+function normalizeImageDestination(destination: string): string {
+  let value = destination.trim()
+  if (value.startsWith("<")) {
+    const close = value.indexOf(">")
+    if (close < 0) return ""
+    value = value.slice(1, close).trim()
+  } else {
+    value = value.replace(TRAILING_IMAGE_TITLE_RE, "").trim()
+  }
+  if (!value) return ""
+  value = value.replace(/\\([\\() ])/g, "$1")
+  try {
+    // decodeURI resolves normal Markdown URL encoding such as %20 while
+    // deliberately preserving encoded path separators such as %2F.
+    return decodeURI(value)
+  } catch {
+    return value
+  }
+}
 
 interface ImageRef {
   full: string // the entire `![alt](url)` substring
   alt: string
   url: string
+  /** Destination exactly as written between parentheses, including a title. */
+  destination: string
   /** 0-based offset of the match in the source markdown — used to
    *  slice the surrounding text for context-aware captioning. */
   index: number
@@ -177,21 +229,101 @@ const CONTEXT_CHARS = 150
 
 function findImageReferences(markdown: string): ImageRef[] {
   const out: ImageRef[] = []
-  // Use exec() in a loop instead of matchAll() so we capture
-  // `m.index` (the position in the source) — needed for the
-  // context slicer below.
-  const re = new RegExp(MD_IMAGE_RE.source, MD_IMAGE_RE.flags)
-  let m: RegExpExecArray | null
-  while ((m = re.exec(markdown)) !== null) {
+  let cursor = 0
+  while (cursor < markdown.length) {
+    const start = markdown.indexOf("![", cursor)
+    if (start < 0) break
+    let altEnd = start + 2
+    let escapedAlt = false
+    for (; altEnd < markdown.length; altEnd++) {
+      const char = markdown[altEnd]
+      if (char === "\r" || char === "\n") break
+      if (escapedAlt) {
+        escapedAlt = false
+        continue
+      }
+      if (char === "\\") {
+        escapedAlt = true
+        continue
+      }
+      if (char === "]") break
+    }
+    if (!markdown.startsWith("](", altEnd)) {
+      cursor = Math.max(start + 2, altEnd + 1)
+      continue
+    }
+    const destinationStart = altEnd + 2
+    let end = destinationStart
+    if (markdown[destinationStart] === "<") {
+      let angleEnd = destinationStart + 1
+      while (
+        angleEnd < markdown.length &&
+        markdown[angleEnd] !== ">" &&
+        markdown[angleEnd] !== "\r" &&
+        markdown[angleEnd] !== "\n"
+      ) angleEnd++
+      if (markdown[angleEnd] !== ">") {
+        cursor = Math.max(destinationStart, angleEnd + 1)
+        continue
+      }
+      end = angleEnd + 1
+      while (end < markdown.length && markdown[end] !== ")" && !/[\r\n]/.test(markdown[end])) end++
+    } else {
+      let depth = 0
+      let escaped = false
+      for (; end < markdown.length; end++) {
+        const char = markdown[end]
+        if (char === "\r" || char === "\n") break
+        if (escaped) {
+          escaped = false
+          continue
+        }
+        if (char === "\\") {
+          escaped = true
+          continue
+        }
+        if (char === "(") depth++
+        else if (char === ")") {
+          if (depth === 0) break
+          depth--
+        }
+      }
+    }
+    if (markdown[end] !== ")") {
+      cursor = Math.max(destinationStart, end + 1)
+      continue
+    }
+    const destination = markdown.slice(destinationStart, end)
+    const url = normalizeImageDestination(destination)
+    if (!url) {
+      cursor = end + 1
+      continue
+    }
+    const full = markdown.slice(start, end + 1)
     out.push({
-      full: m[0],
-      alt: m[2],
-      url: m[4],
-      index: m.index,
-      length: m[0].length,
+      full,
+      alt: markdown.slice(start + 2, altEnd),
+      url,
+      destination,
+      index: start,
+      length: full.length,
     })
+    cursor = end + 1
   }
   return out
+}
+
+export function stripMarkdownImageReferences(markdown: string): string {
+  const refs = findImageReferences(markdown)
+  if (refs.length === 0) return markdown
+  const pieces: string[] = []
+  let cursor = 0
+  for (const ref of refs) {
+    pieces.push(markdown.slice(cursor, ref.index), " ")
+    cursor = ref.index + ref.length
+  }
+  pieces.push(markdown.slice(cursor))
+  return pieces.join("")
 }
 
 /**
@@ -260,6 +392,8 @@ export interface CaptionPipelineOptions {
    * passes the user's chosen value.
    */
   concurrency?: number
+  /** Language requested for factual captions (for example, "German"). */
+  outputLanguage?: string
   /**
    * Progress hook fired after each image finishes (ok or failed),
    * with running counts. Used by ingest to update the activity
@@ -339,7 +473,7 @@ export async function captionMarkdownImages(
     uniqueRefs.push(ref)
   }
 
-  const concurrency = Math.max(1, options?.concurrency ?? 1)
+  const concurrency = clampUserConcurrency(options?.concurrency ?? 1)
   const total = uniqueRefs.length
   let completed = 0
 
@@ -382,7 +516,8 @@ export async function captionMarkdownImages(
     }
 
     const hash = await sha256OfBase64(bytes.base64)
-    const hit = cache[hash]
+    const cacheKey = captionCacheKey(hash, options?.outputLanguage)
+    const hit = cache[cacheKey]
     if (hit) {
       captionByUrl.set(ref.url, hit.caption)
       cachedCaptions++
@@ -401,13 +536,21 @@ export async function captionMarkdownImages(
         bytes.mimeType,
         llmConfig,
         options?.signal,
-        { contextBefore: before, contextAfter: after },
+        {
+          contextBefore: before,
+          contextAfter: after,
+          outputLanguage: options?.outputLanguage,
+        },
       )
-      cache[hash] = {
+      cache[cacheKey] = {
         caption,
         mimeType: bytes.mimeType,
         model: llmConfig.model,
         capturedAt: new Date().toISOString(),
+        imageHash: hash,
+        ...(normalizeCaptionLanguage(options?.outputLanguage)
+          ? { outputLanguage: options?.outputLanguage?.trim() }
+          : {}),
       }
       captionByUrl.set(ref.url, caption)
       freshCaptions++
@@ -453,27 +596,37 @@ export async function captionMarkdownImages(
     }
   }
 
-  // Rewrite the markdown — replace every captured image ref's alt
-  // text with its caption. We use a callback-style replace rather
-  // than running findImageReferences twice so we can sanitize the
-  // alt text inline (no `]` characters or newlines, both of which
-  // would break the markdown).
-  const enrichedMarkdown = markdown.replace(
-    MD_IMAGE_RE,
-    (whole, openBang, _alt, closeBracket, url, closeParen) => {
-      const caption = captionByUrl.get(url)
-      if (!caption) return whole
-      const safe = caption
-        .replace(/[\r\n]+/g, " ") // collapse newlines
-        .replace(/]/g, ")") // ] would close the alt early
-        .trim()
-      return `${openBang}${safe}${closeBracket}${url}${closeParen}`
-    },
-  )
+  // Rewrite all refs in one pass so large image-heavy documents do not copy
+  // the full Markdown string once per image.
+  const pieces: string[] = []
+  let rewriteCursor = 0
+  for (const ref of refs) {
+    const caption = captionByUrl.get(ref.url)
+    pieces.push(markdown.slice(rewriteCursor, ref.index))
+    rewriteCursor = ref.index + ref.length
+    if (!caption) {
+      pieces.push(ref.full)
+      continue
+    }
+    const safe = caption
+      .replace(/[\r\n]+/g, " ")
+      .replace(/]/g, ")")
+      .replace(/\\+$/g, "")
+      .trim()
+    const replacement = `![${safe}](${ref.destination})`
+    pieces.push(replacement)
+  }
+  pieces.push(markdown.slice(rewriteCursor))
+  const enrichedMarkdown = pieces.join("")
 
   return { enrichedMarkdown, freshCaptions, cachedCaptions, failed }
 }
 
 // Exported for direct unit testing — keeps the module surface small
 // while letting the test file pin behavior on the helpers.
-export const __test = { findImageReferences, sha256OfBase64, MD_IMAGE_RE }
+export const __test = {
+  captionCacheKey,
+  findImageReferences,
+  normalizeCaptionLanguage,
+  sha256OfBase64,
+}

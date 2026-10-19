@@ -6,9 +6,49 @@
  */
 import { listDirectory, readFile, writeFile, deleteFile } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
+import {
+  candidatePairs,
+  clusterByPairs,
+  DuplicatePrefilterCancelledError,
+  type CandidatePair,
+  type Page as DedupEmbeddingPage,
+} from "@/lib/dedup_embedding"
+import { loadEmbeddingConfig } from "@/lib/project-store"
 import { normalizePath } from "@/lib/path-utils"
-import type { LlmConfig } from "@/stores/wiki-store"
+import type { EmbeddingConfig, LlmConfig } from "@/stores/wiki-store"
 import type { FileNode } from "@/types/wiki"
+
+/**
+ * Detection emits a bounded JSON list of duplicate groups — a few tens
+ * of tokens per group — so a modest cap covers even a very duplicate-
+ * heavy wiki. The cap's real job is a safety net: without it, a model
+ * that ignores the reasoning-off lever (an unrecognized reasoning model
+ * behind a custom endpoint, e.g. a vLLM Nemotron build) could stream
+ * chain-of-thought unbounded until the 30-min backstop fires — which
+ * surfaces to the user as a bare "request cancelled". Capping turns a
+ * 30-min hang into a fast (truncated) response instead.
+ */
+const DEDUP_DETECTION_MAX_TOKENS = 8_192
+// Conservative defaults: keep enough neighbors for recall while cutting the
+// LLM detector prompt into small candidate batches. The threshold is deliberately
+// below "near duplicate" territory because this tool must catch cross-language
+// aliases, where cosine scores can be weaker on non-multilingual embedders.
+const DEDUP_PREFILTER_TOP_K = 8
+const DEDUP_PREFILTER_THRESHOLD = 0.68
+const DEDUP_PREFILTER_MAX_PAGES = 5_000
+const DEDUP_DETECTOR_BATCH_SUMMARIES = 80
+const DEDUP_FALLBACK_BATCH_OVERLAP = 8
+const DEDUP_EMPTY_PREFILTER_FULL_SCAN_LIMIT = 250
+
+/**
+ * Merge rewrites a COMPLETE page that gets written to disk, so it needs
+ * a generous cap that won't truncate the canonical content. 16K tokens
+ * is ~64KB of text — far beyond any realistic merged entity/concept
+ * page — while still bounding a runaway short of the 30-min backstop.
+ * Kept local (not the ingest generation ladder) so this module doesn't
+ * drag in the heavy ingest dependency graph.
+ */
+const DEDUP_MERGE_MAX_TOKENS = 16_384
 import {
   detectDuplicateGroups,
   extractEntitySummary,
@@ -20,13 +60,23 @@ import {
   type MergeResult,
 } from "./dedup"
 import { loadNotDuplicates } from "./dedup-storage"
+import { resolveIngestReasoning } from "@/lib/reasoning-capabilities"
 
 /**
  * Wrap streamChat into the (system, user, signal) → string shape
  * the dedup module expects. Same pattern page-merge uses — keeps
  * the algorithm modules free of any LlmConfig knowledge.
+ *
+ * `maxTokens` is required, not defaulted: detection and merge have
+ * very different output-size needs (a tiny JSON list vs. a complete
+ * rewritten page), and silently sharing one cap risks truncating a
+ * merged page on disk. Forcing each caller to state its budget makes
+ * that choice explicit.
  */
-export function buildDedupLlmCall(llmConfig: LlmConfig): DedupLlmCall {
+export function buildDedupLlmCall(
+  llmConfig: LlmConfig,
+  maxTokens: number,
+): DedupLlmCall {
   return async (systemPrompt, userMessage, signal) => {
     let result = ""
     let streamError: Error | null = null
@@ -48,7 +98,10 @@ export function buildDedupLlmCall(llmConfig: LlmConfig): DedupLlmCall {
           },
         },
         signal,
-        { temperature: 0.1 },
+        // Dedup detection + merge want compact JSON. Keep the output capped;
+        // reasoning defaults off but remains configurable for models that
+        // require it.
+        { temperature: 0.1, reasoning: resolveIngestReasoning(llmConfig), max_tokens: maxTokens },
       ).catch((err) => {
         streamError = err instanceof Error ? err : new Error(String(err))
         resolve()
@@ -139,11 +192,187 @@ export async function runDuplicateDetection(
   const summaries = await loadAllEntitySummaries(projectPath)
   if (summaries.length < 2) return []
   const notDup = await loadNotDuplicates(projectPath)
-  const llm = buildDedupLlmCall(llmConfig)
-  return detectDuplicateGroups(summaries, llm, {
+  const llm = buildDedupLlmCall(llmConfig, DEDUP_DETECTION_MAX_TOKENS)
+  const embeddingConfig = await loadEmbeddingConfig()
+
+  const embeddingEndpoint =
+    typeof embeddingConfig?.endpoint === "string" ? embeddingConfig.endpoint.trim() : ""
+  if (embeddingConfig?.enabled && embeddingEndpoint) {
+    try {
+      return await detectDuplicateGroupsWithEmbeddingPrefilter(
+        summaries,
+        embeddingConfig,
+        llm,
+        {
+          signal: options.signal,
+          notDuplicates: notDup,
+        },
+      )
+    } catch (err) {
+      if (isAbortError(err) || options.signal?.aborted) throw err
+      if (summaries.length > DEDUP_EMPTY_PREFILTER_FULL_SCAN_LIMIT && isEmbeddingCoverageError(err)) {
+        console.warn("[dedup] embedding prefilter coverage too low; skipping full fallback for large wiki:", err)
+        return []
+      }
+      console.warn("[dedup] embedding prefilter failed; falling back to full LLM scan:", err)
+    }
+  }
+
+  return detectDuplicateGroupsInBoundedBatches(summaries, llm, {
     signal: options.signal,
     notDuplicates: notDup,
   })
+}
+
+async function detectDuplicateGroupsInBoundedBatches(
+  summaries: EntitySummary[],
+  llm: DedupLlmCall,
+  options: { signal?: AbortSignal; notDuplicates?: string[][] },
+): Promise<DuplicateGroup[]> {
+  if (summaries.length <= DEDUP_DETECTOR_BATCH_SUMMARIES) {
+    return detectDuplicateGroups(summaries, llm, options)
+  }
+
+  // Keep likely aliases adjacent while bounding every LLM request. A small
+  // overlap prevents a duplicate pair at a batch boundary from being split.
+  const ordered = [...summaries].sort((left, right) =>
+    `${left.title}\u0000${left.slug}`.localeCompare(`${right.title}\u0000${right.slug}`),
+  )
+  const stride = DEDUP_DETECTOR_BATCH_SUMMARIES - DEDUP_FALLBACK_BATCH_OVERLAP
+  const groups: DuplicateGroup[] = []
+  for (let start = 0; start < ordered.length; start += stride) {
+    if (options.signal?.aborted) throw new Error("Duplicate scan cancelled")
+    const batch = ordered.slice(start, start + DEDUP_DETECTOR_BATCH_SUMMARIES)
+    if (batch.length < 2) break
+    groups.push(...await detectDuplicateGroups(batch, llm, options))
+  }
+  return uniqueDuplicateGroups(groups)
+}
+
+async function detectDuplicateGroupsWithEmbeddingPrefilter(
+  summaries: EntitySummary[],
+  embeddingConfig: EmbeddingConfig,
+  llm: DedupLlmCall,
+  options: { signal?: AbortSignal; notDuplicates?: string[][] },
+): Promise<DuplicateGroup[]> {
+  const pages = summaries.map(summaryToEmbeddingPage)
+  const pairs = await candidatePairs(pages, embeddingConfig, {
+    topK: DEDUP_PREFILTER_TOP_K,
+    threshold: DEDUP_PREFILTER_THRESHOLD,
+    maxPages: DEDUP_PREFILTER_MAX_PAGES,
+    signal: options.signal,
+  })
+  if (pairs.length === 0) {
+    // Preserve recall for small/medium wikis: a weak or non-multilingual
+    // embedder can miss exactly the cross-language aliases the LLM detector
+    // is meant to find. For large wikis, the old full scan is what caused
+    // #359 hangs, so no candidates means no detector call.
+    return summaries.length <= DEDUP_EMPTY_PREFILTER_FULL_SCAN_LIMIT
+      ? detectDuplicateGroupsInBoundedBatches(summaries, llm, options)
+      : []
+  }
+
+  const summaryByPath = new Map(summaries.map((s) => [s.path, s]))
+  const filteredPairs = filterWhitelistedPairs(pairs, summaryByPath, options.notDuplicates ?? [])
+  if (filteredPairs.length === 0) return []
+
+  const pageIds = summaries.map((s) => s.path)
+  const clusters = clusterByPairs(pageIds, filteredPairs)
+  if (clusters.length === 0) return []
+
+  const batches = batchCandidateClusters(clusters, summaryByPath)
+  const out: DuplicateGroup[] = []
+
+  for (const batch of batches) {
+    if (options.signal?.aborted) throw new Error("Duplicate scan cancelled")
+    const detected = await detectDuplicateGroups(batch, llm, options)
+    out.push(...detected)
+  }
+
+  return uniqueDuplicateGroups(out)
+}
+
+function summaryToEmbeddingPage(summary: EntitySummary): DedupEmbeddingPage {
+  return {
+    id: summary.path,
+    title: summary.title,
+    body: summary.description ?? "",
+    tags: summary.tags,
+  }
+}
+
+function batchCandidateClusters(
+  clusters: string[][],
+  summaryByPath: Map<string, EntitySummary>,
+): EntitySummary[][] {
+  const batches: EntitySummary[][] = []
+  let current: EntitySummary[] = []
+
+  for (const cluster of clusters) {
+    const summaries = cluster
+      .map((pageId) => summaryByPath.get(pageId))
+      .filter((summary): summary is EntitySummary => !!summary)
+    if (summaries.length < 2) continue
+
+    if (
+      current.length > 0
+      && current.length + summaries.length > DEDUP_DETECTOR_BATCH_SUMMARIES
+    ) {
+      batches.push(current)
+      current = []
+    }
+
+    current.push(...summaries)
+
+    if (current.length >= DEDUP_DETECTOR_BATCH_SUMMARIES) {
+      batches.push(current)
+      current = []
+    }
+  }
+
+  if (current.length > 0) batches.push(current)
+  return batches
+}
+
+function uniqueDuplicateGroups(groups: DuplicateGroup[]): DuplicateGroup[] {
+  const seen = new Set<string>()
+  const out: DuplicateGroup[] = []
+  for (const group of groups) {
+    const key = group.slugs.map((slug) => slug.toLowerCase()).sort().join("\t")
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(group)
+  }
+  return out
+}
+
+function filterWhitelistedPairs(
+  pairs: CandidatePair[],
+  summaryByPath: Map<string, EntitySummary>,
+  notDuplicates: string[][],
+): CandidatePair[] {
+  if (notDuplicates.length === 0) return pairs
+  const notDupSet = new Set(notDuplicates.map(normalizeSlugGroupKey))
+  return pairs.filter(([a, b]) => {
+    const left = summaryByPath.get(a)?.slug
+    const right = summaryByPath.get(b)?.slug
+    if (!left || !right) return true
+    return !notDupSet.has(normalizeSlugGroupKey([left, right]))
+  })
+}
+
+function normalizeSlugGroupKey(slugs: readonly string[]): string {
+  return slugs.map((slug) => slug.toLowerCase()).sort().join("\t")
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DuplicatePrefilterCancelledError
+    || (err instanceof Error && err.name === "AbortError")
+}
+
+function isEmbeddingCoverageError(err: unknown): boolean {
+  return err instanceof Error
+    && /could not embed enough pages|embedded only \d+\/\d+ pages/i.test(err.message)
 }
 
 /**
@@ -198,7 +427,10 @@ export async function executeMerge(
   const groupPaths = new Set(groupPages.map((p) => p.path))
   const otherPages = allPages.filter((p) => !groupPaths.has(p.path))
 
-  const llm = buildDedupLlmCall(llmConfig)
+  // Merge rewrites a COMPLETE page that gets written to disk, so it gets
+  // the generous merge budget — never the small detection cap, which
+  // would truncate the canonical content.
+  const llm = buildDedupLlmCall(llmConfig, DEDUP_MERGE_MAX_TOKENS)
   const result = await mergeDuplicateGroup(
     {
       group: groupPages,

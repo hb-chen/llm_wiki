@@ -4,22 +4,32 @@ import {
   getFileMd5,
   getFileSize,
   listDirectory,
-  preprocessFile,
   readFile,
   writeFileAtomic,
 } from "@/commands/fs"
 import type { FileNode, WikiProject } from "@/types/wiki"
 import { isAbsolutePath, normalizePath } from "@/lib/path-utils"
 import { useWikiStore } from "@/stores/wiki-store"
-import type { ScheduledImportConfig } from "@/stores/wiki-store"
+import type { ScheduledImportConfig, SourceWatchConfig } from "@/stores/wiki-store"
 import {
   loadScheduledImportConfig,
+  loadSourceWatchConfig,
   saveScheduledImportConfig,
+  getRecentProjects,
 } from "@/lib/project-store"
 import {
+  isPathAllowedBySourceWatch,
+  normalizeSourceWatchConfig,
+} from "@/lib/source-watch-config"
+import {
+  deleteSourceFile,
   enqueueSourceIngest,
+  folderContextForSourcePath,
   isIngestableSourcePath,
 } from "@/lib/source-lifecycle"
+import { discardTasksForSources, enqueueInactiveProjectBatch } from "@/lib/ingest-queue"
+import { useActivityStore } from "@/stores/activity-store"
+import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
 interface ImportDb {
   files: Record<string, string>
@@ -38,6 +48,8 @@ interface ImportDbStore {
 
 type ScanOptions = {
   runId?: number
+  allowInactive?: boolean
+  sourceWatchConfig?: SourceWatchConfig
 }
 
 const EMPTY_DB: ImportDb = {
@@ -48,12 +60,13 @@ const EMPTY_DB: ImportDb = {
 let scanTimer: ReturnType<typeof setInterval> | null = null
 let scanning = false
 let activeRunId = 0
+const managedPathWarningKeys = new Set<string>()
 
 const DB_PATH = ".llm-wiki/scheduled-import-db.json"
 const LEGACY_DB_DIR = ".llm-wiki-imported"
 const SCHEDULED_IMPORT_DIR = "scheduled-import"
 const MAX_SCHEDULED_IMPORT_BYTES = 100 * 1024 * 1024
-const SENSITIVE_CONFIG_EXTENSIONS = new Set(["json", "yaml", "yml", "xml"])
+const SCHEDULED_IMPORT_CONFIG_EXTENSIONS = new Set(["json", "yaml", "yml", "xml"])
 const RESERVED_WINDOWS_NAMES = new Set([
   "con",
   "prn",
@@ -88,7 +101,12 @@ function dbFilePath(projectPath: string): string {
 }
 
 function dbDirectoryKey(importPath: string): string {
-  const normalized = normalizePath(importPath)
+  return caseFoldPath(normalizePath(importPath))
+}
+
+// Windows drive-letter and UNC paths are case-insensitive; fold them for
+// comparison purposes only (never for the paths actually written to disk).
+function caseFoldPath(normalized: string): string {
   return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//")
     ? normalized.toLowerCase()
     : normalized
@@ -102,8 +120,8 @@ function cloneDb(db: ImportDb): ImportDb {
 }
 
 function isPathInside(path: string, parent: string): boolean {
-  const normalizedPath = normalizePath(path)
-  const normalizedParent = normalizePath(parent).replace(/\/+$/, "")
+  const normalizedPath = dbDirectoryKey(path)
+  const normalizedParent = dbDirectoryKey(parent).replace(/\/+$/, "")
   return (
     normalizedPath === normalizedParent ||
     normalizedPath.startsWith(`${normalizedParent}/`)
@@ -112,6 +130,35 @@ function isPathInside(path: string, parent: string): boolean {
 
 function projectSubpath(projectPath: string, relPath: string): string {
   return `${normalizePath(projectPath)}/${relPath}`
+}
+
+export function isProjectManagedScheduledImportPath(
+  projectPath: string,
+  importPath: string,
+): boolean {
+  const project = normalizePath(projectPath).replace(/\/+$/, "")
+  const root = normalizePath(importPath).replace(/\/+$/, "")
+  return (
+    root === project ||
+    isPathInside(project, root) ||
+    isPathInside(root, projectSubpath(project, "raw")) ||
+    isPathInside(root, projectSubpath(project, "raw/sources")) ||
+    isPathInside(root, projectSubpath(project, "wiki")) ||
+    isPathInside(root, projectSubpath(project, ".llm-wiki"))
+  )
+}
+
+function notifyManagedScheduledImportPath(project: WikiProject, importRoot: string): void {
+  const key = `${project.id}:${normalizePath(importRoot)}`
+  if (managedPathWarningKeys.has(key)) return
+  managedPathWarningKeys.add(key)
+  useActivityStore.getState().addItem({
+    type: "ingest",
+    title: "Scheduled import skipped",
+    status: "error",
+    detail: `Scheduled import path is inside or contains the current LLM Wiki project: ${importRoot}. Choose an external folder; project sources are handled by source folder monitoring.`,
+    filesWritten: [],
+  })
 }
 
 function stableSuffix(input: string): string {
@@ -196,10 +243,10 @@ export function shouldSkipScheduledImportFile(
   return name.startsWith(".")
 }
 
-function isSensitiveConfigFile(path: string): boolean {
+export function shouldSkipScheduledImportConfigFile(path: string): boolean {
   const name = normalizePath(path).split("/").pop() ?? ""
   const ext = name.includes(".") ? name.split(".").pop()?.toLowerCase() : ""
-  return Boolean(ext && SENSITIVE_CONFIG_EXTENSIONS.has(ext))
+  return Boolean(ext && SCHEDULED_IMPORT_CONFIG_EXTENSIONS.has(ext))
 }
 
 export function resolveImportPath(projectPath: string, configPath: string): string {
@@ -224,8 +271,10 @@ export function scheduledImportDestinationForFile(
   }
 
   const importRoot = normalizePath(importPath).replace(/\/+$/, "")
+  const sourceKey = caseFoldPath(source)
+  const importRootKey = caseFoldPath(importRoot)
   const relative =
-    source === importRoot || !source.startsWith(`${importRoot}/`)
+    sourceKey === importRootKey || !sourceKey.startsWith(`${importRootKey}/`)
       ? file.name
       : source.slice(importRoot.length + 1)
 
@@ -242,6 +291,58 @@ function collectFiles(nodes: FileNode[]): FileNode[] {
     }
   }
   return files
+}
+
+function scheduledImportDestinationForSourceKey(
+  projectPath: string,
+  importPath: string,
+  sourceKey: string,
+): string {
+  const name = normalizePath(sourceKey).split("/").pop() ?? "_"
+  return scheduledImportDestinationForFile(projectPath, importPath, {
+    name,
+    path: sourceKey,
+  })
+}
+
+async function cleanupRemovedScheduledImports(
+  project: WikiProject,
+  importRoot: string,
+  db: ImportDb,
+  observedEligibleKeys: ReadonlySet<string>,
+  nextDb: ImportDb,
+): Promise<boolean> {
+  const removedKeys = Object.keys(db.files).filter(
+    (key) => !observedEligibleKeys.has(key) && !(key in nextDb.files),
+  )
+  if (removedKeys.length === 0) return false
+
+  const destinations = removedKeys.map((key) => ({
+    key,
+    path: scheduledImportDestinationForSourceKey(project.path, importRoot, key),
+  }))
+  await discardTasksForSources(destinations.map((entry) => entry.path))
+
+  let changed = false
+  for (const destination of destinations) {
+    try {
+      const exists = await fileExists(destination.path)
+      await deleteSourceFile(project.path, destination.path, {
+        fileAlreadyDeleted: !exists,
+        logReason: "scheduled import source removed or excluded",
+      })
+      changed = true
+    } catch (err) {
+      // Preserve the old record so a later scan retries cleanup rather than
+      // silently forgetting a stale mirror or its generated wiki pages.
+      nextDb.files[destination.key] = db.files[destination.key]
+      console.warn(
+        `[scheduled-import] failed to clean removed source ${destination.path}:`,
+        err,
+      )
+    }
+  }
+  return changed
 }
 
 async function loadDbStore(projectPath: string): Promise<ImportDbStore> {
@@ -270,8 +371,22 @@ async function loadImportDb(
   importPath: string,
 ): Promise<ImportDb> {
   const store = await loadDbStore(projectPath)
-  const db = store.directories[dbDirectoryKey(importPath)]
-  return db ? cloneDb(db) : cloneDb(EMPTY_DB)
+  const directoryKey = dbDirectoryKey(importPath)
+  const db = store.directories[directoryKey] ??
+    Object.entries(store.directories).find(
+      ([storedKey]) => dbDirectoryKey(storedKey) === directoryKey,
+    )?.[1]
+  if (!db) return cloneDb(EMPTY_DB)
+
+  // Older builds persisted Windows directory and file keys with their
+  // observed casing. Normalize both levels while loading so upgrading does
+  // not make the first scan treat every unchanged file as new.
+  return {
+    files: Object.fromEntries(
+      Object.entries(db.files).map(([path, md5]) => [dbDirectoryKey(path), md5]),
+    ),
+    lastScan: db.lastScan,
+  }
 }
 
 async function saveImportDb(
@@ -292,8 +407,23 @@ function isCurrentProject(projectId: string): boolean {
   return useWikiStore.getState().project?.id === projectId
 }
 
-function isCurrentRun(projectId: string, runId?: number): boolean {
-  return isCurrentProject(projectId) && (runId === undefined || runId === activeRunId)
+function isCurrentRun(
+  projectId: string,
+  runId?: number,
+  allowInactive = false,
+): boolean {
+  return (allowInactive || isCurrentProject(projectId)) &&
+    (runId === undefined || runId === activeRunId)
+}
+
+export function isScheduledImportDue(
+  config: ScheduledImportConfig,
+  now = Date.now(),
+): boolean {
+  if (!config.enabled || !config.path || config.interval <= 0) return false
+  if (!config.lastScan) return true
+  const intervalMs = Math.max(1, Math.min(1440, config.interval)) * 60 * 1000
+  return now - config.lastScan >= intervalMs
 }
 
 export async function scanAndImport(
@@ -301,47 +431,71 @@ export async function scanAndImport(
   importPath: string,
   options: ScanOptions = {},
 ): Promise<void> {
-  if (!importPath || scanning) return
+  if (!importPath) return
 
-  scanning = true
   const projectPath = normalizePath(project.path)
   const importRoot = resolveImportPath(projectPath, importPath)
+  if (isProjectManagedScheduledImportPath(projectPath, importRoot)) {
+    console.warn(
+      `[scheduled-import] skipped self-referential path "${importRoot}". Use source folder monitoring for project sources instead.`,
+    )
+    if (isCurrentProject(project.id)) {
+      notifyManagedScheduledImportPath(project, importRoot)
+    }
+    return
+  }
+
+  if (scanning) return
+
+  scanning = true
 
   try {
-    if (!isCurrentRun(project.id, options.runId)) {
+    if (!isCurrentRun(project.id, options.runId, options.allowInactive)) {
       return
     }
 
     const tree = await listDirectory(importRoot)
+    const sourceWatchConfig = normalizeSourceWatchConfig(
+      options.sourceWatchConfig ??
+        (isCurrentProject(project.id)
+          ? useWikiStore.getState().sourceWatchConfig
+          : await loadSourceWatchConfig(project.id)),
+    )
+    const maxFileSizeBytes = sourceWatchConfig.maxFileSizeMb * 1024 * 1024
     const db = await loadImportDb(projectPath, importRoot)
     const nextDb: ImportDb = { files: {}, lastScan: Date.now() }
-    const llmConfig = useWikiStore.getState().llmConfig
     const changedFiles: Array<{ key: string; md5: string; destPath: string }> = []
+    const observedEligibleKeys = new Set<string>()
 
     for (const file of collectFiles(tree)) {
       try {
         const sourcePath = normalizePath(file.path)
         if (
           shouldSkipScheduledImportFile(projectPath, sourcePath) ||
-          isSensitiveConfigFile(sourcePath) ||
+          shouldSkipScheduledImportConfigFile(sourcePath) ||
+          !isPathAllowedBySourceWatch(sourcePath, sourceWatchConfig) ||
           !isIngestableSourcePath(sourcePath)
         ) {
           continue
         }
 
-        if (!isCurrentRun(project.id, options.runId)) {
+        const key = dbDirectoryKey(sourcePath)
+
+        if (!isCurrentRun(project.id, options.runId, options.allowInactive)) {
           return
         }
 
         const size = await getFileSize(sourcePath)
-        if (size > MAX_SCHEDULED_IMPORT_BYTES) {
+        if (size > Math.min(MAX_SCHEDULED_IMPORT_BYTES, maxFileSizeBytes)) {
+          const limitMb = Math.min(100, sourceWatchConfig.maxFileSizeMb)
           console.warn(
-            `[scheduled-import] skipping ${sourcePath}: ${(size / 1024 / 1024).toFixed(1)} MB exceeds 100 MB limit`,
+            `[scheduled-import] skipping ${sourcePath}: ${(size / 1024 / 1024).toFixed(1)} MB exceeds ${limitMb} MB limit`,
           )
           continue
         }
 
-        const key = sourcePath
+        observedEligibleKeys.add(key)
+
         const md5 = await getFileMd5(sourcePath)
 
         if (db.files[key] === md5) {
@@ -355,30 +509,75 @@ export async function scanAndImport(
         }
         changedFiles.push({ key, md5, destPath })
       } catch (err) {
+        const key = dbDirectoryKey(file.path)
+        if (db.files[key]) {
+          nextDb.files[key] = db.files[key]
+        }
         console.warn(`[scheduled-import] skipped ${file.path}:`, err)
       }
     }
 
-    if (!isCurrentRun(project.id, options.runId)) {
+    if (!isCurrentRun(project.id, options.runId, options.allowInactive)) {
+      return
+    }
+
+    let removedSourcesChanged = false
+    if (isCurrentProject(project.id)) {
+      removedSourcesChanged = await cleanupRemovedScheduledImports(
+        project,
+        importRoot,
+        db,
+        observedEligibleKeys,
+        nextDb,
+      )
+    } else {
+      // Defer destructive cleanup until the project is opened. Preserve old
+      // records so the first active scan can still identify removals.
+      for (const [key, md5] of Object.entries(db.files)) {
+        if (!observedEligibleKeys.has(key)) nextDb.files[key] = md5
+      }
+    }
+
+    if (!isCurrentRun(project.id, options.runId, options.allowInactive)) {
       return
     }
 
     if (changedFiles.length > 0) {
       const destPaths = changedFiles.map((file) => file.destPath)
-      await Promise.all(destPaths.map((path) => preprocessFile(path).catch(() => {})))
-      if (isCurrentRun(project.id, options.runId)) {
-        const ids = await enqueueSourceIngest(project, destPaths, llmConfig)
+      if (isCurrentRun(project.id, options.runId, options.allowInactive)) {
+        const ids = isCurrentProject(project.id)
+          ? await enqueueSourceIngest(
+              project,
+              destPaths,
+              useWikiStore.getState().llmConfig,
+            )
+          : await enqueueInactiveProjectBatch(
+              project.id,
+              project.path,
+              destPaths.map((sourcePath) => ({
+                sourcePath,
+                folderContext: folderContextForSourcePath(sourcePath),
+              })),
+            )
         if (ids.length > 0) {
           for (const file of changedFiles) {
             nextDb.files[file.key] = file.md5
           }
-          const projectTree = await listDirectory(projectPath)
-          useWikiStore.getState().setFileTree(projectTree)
-          useWikiStore.getState().bumpDataVersion()
         } else {
           console.warn("[scheduled-import] LLM is not configured; changed files were not marked imported")
         }
       }
+    }
+
+
+    if (
+      isCurrentProject(project.id) &&
+      (removedSourcesChanged || changedFiles.some((file) => nextDb.files[file.key]))
+    ) {
+      await refreshProjectFileTree(projectPath, {
+        projectId: project.id,
+        bumpDataVersion: true,
+      })
     }
 
     await saveImportDb(projectPath, importRoot, nextDb)
@@ -410,18 +609,51 @@ export function startScheduledImport(
 ): void {
   stopScheduledImport()
 
-  if (!config.enabled || !config.path || config.interval <= 0) {
-    return
-  }
-
   const runId = ++activeRunId
-  const intervalMs = Math.max(1, Math.min(1440, config.interval)) * 60 * 1000
-
-  void scanAndImport(project, config.path, { runId })
+  void runScheduledImportSweep(project, config, runId, true).catch((err) => {
+    console.error("Scheduled import sweep failed:", err)
+  })
 
   scanTimer = setInterval(() => {
-    void scanAndImport(project, config.path, { runId })
-  }, intervalMs)
+    void runScheduledImportSweep(project, config, runId, false).catch((err) => {
+      console.error("Scheduled import sweep failed:", err)
+    })
+  }, 60 * 1000)
+}
+
+async function runScheduledImportSweep(
+  activeProject: WikiProject,
+  activeConfig: ScheduledImportConfig,
+  runId: number,
+  forceActive: boolean,
+): Promise<void> {
+  const recents = await getRecentProjects()
+  const projects = [activeProject, ...recents.filter((item) => item.id !== activeProject.id)]
+  for (const project of projects) {
+    if (runId !== activeRunId) return
+    let config: ScheduledImportConfig | null
+    try {
+      config = project.id === activeProject.id
+        ? forceActive
+          ? activeConfig
+          : (await loadScheduledImportConfig(project.path)) ?? activeConfig
+        : await loadScheduledImportConfig(project.path)
+    } catch (err) {
+      console.warn(`[scheduled-import] failed to load config for ${project.path}:`, err)
+      continue
+    }
+    if (!config) continue
+    if (!isScheduledImportDue(config) && !(project.id === activeProject.id && forceActive)) {
+      continue
+    }
+    if (!config.enabled || !config.path || config.interval <= 0) {
+      continue
+    }
+    await scanAndImport(project, config.path, {
+      runId,
+      allowInactive: project.id !== activeProject.id,
+    })
+  }
 }
 
 export function stopScheduledImport(): void {

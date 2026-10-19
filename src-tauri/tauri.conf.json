@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LLM Wiki",
-  "version": "0.4.18",
+  "version": "0.6.12",
   "identifier": "com.llmwiki.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:desktop",
     "frontendDist": "../dist"
   },
   "app": {
@@ -18,15 +18,11 @@
         "resizable": true,
         "fullscreen": false,
         "hiddenTitle": true,
-        "titleBarStyle": "Overlay",
-        "trafficLightPosition": {
-          "x": 16,
-          "y": 16
-        }
+        "titleBarStyle": "Transparent"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https: http:; img-src 'self' asset: https://asset.localhost; media-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'",
+      "csp": "default-src 'self'; connect-src 'self' https: http:; img-src 'self' asset: http://asset.localhost https://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost https://asset.localhost; style-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
         "scope": ["**"]
@@ -40,6 +36,7 @@
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ]

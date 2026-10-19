@@ -1,6 +1,13 @@
 import { create } from "zustand"
 import type { WikiProject, FileNode } from "@/types/wiki"
 import { DEFAULT_SOURCE_WATCH_CONFIG } from "@/lib/source-watch-config"
+import {
+  buildProjectPathIndexFromTree,
+  createEmptyProjectPathIndex,
+  type ProjectPathIndex,
+} from "@/lib/wiki-page-resolver"
+import { DEFAULT_GRAPH_FILTERS, type GraphFilterState } from "@/lib/graph-filters"
+import type { OutputLanguage } from "@/lib/output-language-options"
 
 /**
  * Wire protocol used when `provider === "custom"`. Other providers have a
@@ -28,9 +35,40 @@ interface LlmConfig {
   maxContextSize: number // max context window in characters
   apiMode?: CustomApiMode
   reasoning?: ReasoningConfig
+  /**
+   * Reasoning for ingest's structured calls (analysis, page generation,
+   * captioning, dedup), kept separate from `reasoning` because the two want
+   * opposite things: chat benefits from thinking, whereas ingest asks for
+   * structured output thousands of times and a model that spends its budget on
+   * chain-of-thought can end the stream with empty `content` — a lost page.
+   * Defaults to "off", which is what ingest hardcoded before this was settable.
+   */
+  ingestReasoning?: ReasoningConfig
+  /**
+   * Local CLI providers only. When true, LLM Wiki asks Claude/Codex CLI
+   * to ignore user-level rules/config/MCP/tool state where the CLI exposes
+   * such controls. Default false preserves existing advanced-user setups.
+   */
+  localCliIsolation?: boolean
+  /** Codex CLI provider only. Overall subprocess timeout in minutes. */
+  codexCliTimeoutMinutes?: number
+  /** HTTP LLM request backstop. Defaults to 30 minutes for legacy configs. */
+  requestTimeoutMinutes?: number
+  /** Defaults to true. HTTP providers use a non-streaming wire when false. */
+  streamingEnabled?: boolean
+  /** Optional headers added to every HTTP request for this provider preset. */
+  customHeaders?: Record<string, string>
 }
 
-export type SearchProvider = "tavily" | "serpapi" | "searxng" | "ollama" | "none"
+export type SearchProvider =
+  | "tavily"
+  | "serpapi"
+  | "searxng"
+  | "ollama"
+  | "brave"
+  | "bocha"
+  | "firecrawl"
+  | "none"
 export type DeepResearchSource = "web" | "anytxt" | "both"
 export type SerpApiEngine =
   | "google"
@@ -58,6 +96,7 @@ export type SearXngCategory =
 
 export interface SearchProviderOverride {
   apiKey?: string
+  baseUrl?: string
   serpApiEngine?: SerpApiEngine
   searXngUrl?: string
   searXngCategories?: SearXngCategory[]
@@ -108,6 +147,10 @@ interface EmbeddingConfig {
    */
   maxChunkChars?: number
   overlapChunkChars?: number
+  /** Maximum embedding HTTP requests in flight. Defaults to 1 for compatibility. */
+  concurrency?: number
+  /** Texts per OpenAI-compatible embedding request. Defaults to 1. */
+  batchSize?: number
   /**
    * Extra HTTP headers to send with every embedding request, e.g.
    *   { "X-Model-Provider-Id": "siliconflow" }
@@ -142,9 +185,8 @@ interface EmbeddingConfig {
  * `concurrency` bounds parallel caption requests during ingest.
  * 30-image PDFs with sequential captioning at ~10s/image (a Qwen3
  * thinking model on consumer GPU) take 5 minutes. At concurrency=4
- * that drops to ~75s. Going wider than 8 typically just queues
- * behind a single-GPU server's batch slot, so we cap the slider
- * UI at a tasteful max in the settings view.
+ * that drops to ~75s. Higher values are available for hosted or
+ * multi-GPU endpoints that can sustain broader parallelism.
  */
 /**
  * Global outbound HTTP proxy. When `enabled` and `url` is a valid
@@ -157,6 +199,7 @@ interface ProxyConfig {
   enabled: boolean
   url: string
   bypassLocal: boolean
+  acceptInvalidCerts?: boolean
 }
 
 interface ScheduledImportConfig {
@@ -176,6 +219,8 @@ interface ScheduledImportConfig {
  *     env-token-only setup keeps working after the toggle is added.
  *   - `allowUnauthenticated` lets local agents call the API without a
  *     token. It is explicit and default-off.
+ *   - `allowLanAccess` binds the API and clip server to 0.0.0.0 on
+ *     app startup so trusted LAN devices can reach them. Default-off.
  *   - `mcpEnabled` allows the optional MCP stdio server to use this
  *     API. It is separate from the HTTP API kill-switch so users can
  *     expose scripts while keeping MCP disabled.
@@ -186,11 +231,34 @@ interface ScheduledImportConfig {
 interface ApiConfig {
   enabled: boolean
   allowUnauthenticated: boolean
+  allowLanAccess: boolean
   mcpEnabled: boolean
   token: string
 }
 
 export type CloseBehavior = "ask" | "minimize" | "exit"
+
+export type GraphColorMode = "type" | "community"
+
+export interface GraphUiState {
+  colorMode: GraphColorMode
+  filters: GraphFilterState
+  nodeScale: number
+  graphSpacingDraft: number
+}
+
+export function createDefaultGraphUiState(): GraphUiState {
+  return {
+    colorMode: "type",
+    filters: {
+      ...DEFAULT_GRAPH_FILTERS,
+      hiddenTypes: new Set(),
+      hiddenNodeIds: new Set(),
+    },
+    nodeScale: 1,
+    graphSpacingDraft: 1,
+  }
+}
 
 export interface GeneralConfig {
   autostart: boolean
@@ -200,11 +268,47 @@ export interface GeneralConfig {
 interface SourceWatchConfig {
   enabled: boolean
   autoIngest: boolean
+  /** Keep extractor output in raw/parsed in addition to the internal cache. */
+  persistExtractedMarkdown: boolean
+  /** Maximum number of source text extraction jobs allowed at once. */
+  parsingConcurrency: number
+  /** Maximum number of ingest tasks allowed to prepare concurrently. */
+  ingestConcurrency: number
   includeExtensions: string[]
   excludeExtensions: string[]
   excludeDirs: string[]
   excludeGlobs: string[]
   maxFileSizeMb: number
+}
+
+export type MineruModelVersion = "pipeline" | "vlm"
+export type MineruLocalBackend =
+  | "pipeline"
+  | "vlm-engine"
+  | "hybrid-engine"
+  | "vlm-http-client"
+  | "hybrid-http-client"
+export type MineruParseMethod = "auto" | "txt" | "ocr"
+export type MineruEffort = "medium" | "high"
+
+export interface MineruConfig {
+  enabled: boolean
+  /** Parsing backend: MinerU cloud API (default) or a self-hosted local service. */
+  backend?: "cloud" | "local"
+  /** Base URL of a compatible self-hosted MinerU HTTP wrapper. */
+  localEndpoint?: string
+  /** Optional Bearer token used only for the self-hosted MinerU service. */
+  localToken?: string
+  localBackend?: MineruLocalBackend
+  localEffort?: MineruEffort
+  localParseMethod?: MineruParseMethod
+  localLanguage?: string
+  localFormulaEnabled?: boolean
+  localTableEnabled?: boolean
+  localImageAnalysis?: boolean
+  localServerUrl?: string
+  token: string
+  modelVersion: MineruModelVersion
 }
 
 interface MultimodalConfig {
@@ -225,36 +329,6 @@ interface MultimodalConfig {
 }
 
 /**
- * Output language for LLM-generated content (wiki pages, chat responses, research).
- * "auto" = detect from user input / source document language.
- * Otherwise = force all LLM output to use the specified language.
- */
-type OutputLanguage =
-  | "auto"
-  | "English"
-  | "Chinese"
-  | "Traditional Chinese"
-  | "Japanese"
-  | "Korean"
-  | "Vietnamese"
-  | "French"
-  | "German"
-  | "Spanish"
-  | "Portuguese"
-  | "Italian"
-  | "Russian"
-  | "Arabic"
-  | "Persian"
-  | "Hindi"
-  | "Turkish"
-  | "Dutch"
-  | "Polish"
-  | "Swedish"
-  | "Indonesian"
-  | "Thai"
-  | "Ukrainian"
-
-/**
  * Per-preset saved fields. Each entry survives turning the preset off
  * and coming back — users don't have to re-enter an API key when they
  * briefly switch to a different provider.
@@ -268,9 +342,42 @@ export interface ProviderOverride {
   apiMode?: CustomApiMode
   maxContextSize?: number
   reasoning?: ReasoningConfig
+  /** Reasoning used by structured ingest calls; defaults to off. */
+  ingestReasoning?: ReasoningConfig
+  localCliIsolation?: boolean
+  codexCliTimeoutMinutes?: number
+  requestTimeoutMinutes?: number
+  streamingEnabled?: boolean
+  customHeaders?: Record<string, string>
 }
 
 export type ProviderConfigs = Record<string, ProviderOverride>
+
+export interface CustomLlmPreset {
+  id: string
+  label: string
+}
+
+export interface TaskModelRoutingConfig {
+  /** Null keeps chat on the globally active provider preset. */
+  chatPresetId: string | null
+  /** Null keeps ingest on the globally active provider preset. */
+  ingestPresetId: string | null
+}
+
+export interface ProjectLlmOverride {
+  enabled: boolean
+  presetId: string | null
+  /** Empty uses the selected preset/global provider model. */
+  model: string
+  /**
+   * Resolved provider metadata for native/API callers. The API key is
+   * deliberately omitted: Rust merges the current credential from
+   * providerConfigs[presetId], so rotating a key never requires rewriting
+   * every project override and credentials are not duplicated per project.
+   */
+  profile?: Omit<LlmConfig, "apiKey" | "customHeaders">
+}
 
 export interface ExternalPreview {
   title: string
@@ -283,9 +390,23 @@ export interface ExternalPreview {
 interface WikiState {
   project: WikiProject | null
   fileTree: FileNode[]
+  /**
+   * Lightweight lookup index derived from `fileTree`. Production code must
+   * update fileTree through `setFileTree` so this stays in sync; direct
+   * `useWikiStore.setState({ fileTree })` is only for tests that also reset or
+   * do not read path resolution.
+   */
+  projectPathIndex: ProjectPathIndex
   selectedFile: string | null
   fileContent: string
+  previewContentPath: string | null
   externalPreview: ExternalPreview | null
+  /**
+   * View that handed control to the full-width wiki preview. Closing the
+   * preview must return there instead of leaving an empty wiki surface.
+   * This is transient navigation state and must not be persisted.
+   */
+  previewReturnView: Exclude<WikiState["activeView"], "wiki"> | null
   /**
    * One-shot scroll target for the markdown preview. When the user
    * clicks an image in search results and chooses "jump to source",
@@ -301,13 +422,17 @@ interface WikiState {
    * one wiki-relative) still works.
    */
   pendingScrollImageSrc: string | null
-  chatExpanded: boolean
-  activeView: "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "settings"
+  activeView: "chat" | "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "skills" | "settings"
   llmConfig: LlmConfig
+  /** Persisted global/default config, kept separate while a project override is effective. */
+  globalLlmConfig: LlmConfig
   /** Per-provider-preset stored overrides (API key, model, endpoint, …). */
   providerConfigs: ProviderConfigs
+  customLlmPresets: CustomLlmPreset[]
   /** Which preset is currently active. `null` = no LLM configured. */
   activePresetId: string | null
+  taskModelRouting: TaskModelRoutingConfig
+  projectLlmOverride: ProjectLlmOverride
   searchApiConfig: SearchApiConfig
   embeddingConfig: EmbeddingConfig
   multimodalConfig: MultimodalConfig
@@ -315,21 +440,31 @@ interface WikiState {
   proxyConfig: ProxyConfig
   scheduledImportConfig: ScheduledImportConfig
   sourceWatchConfig: SourceWatchConfig
+  sourceWatchAllProjects: boolean
+  mineruConfig: MineruConfig
   apiConfig: ApiConfig
   generalConfig: GeneralConfig
+  graphUiState: GraphUiState
   dataVersion: number
 
   setProject: (project: WikiProject | null) => void
-  setFileTree: (tree: FileNode[]) => void
+  setFileTree: (tree: FileNode[], options?: { syncPathIndex?: boolean }) => void
+  setProjectPathIndexFromTree: (tree: FileNode[]) => void
   setSelectedFile: (path: string | null) => void
   setFileContent: (content: string) => void
+  openPathInPreview: (path: string) => void
+  openFileInPreview: (path: string, content: string) => void
+  closePreview: () => void
   setExternalPreview: (preview: ExternalPreview | null) => void
   setPendingScrollImageSrc: (src: string | null) => void
-  setChatExpanded: (expanded: boolean) => void
   setActiveView: (view: WikiState["activeView"]) => void
   setLlmConfig: (config: LlmConfig) => void
+  setGlobalLlmConfig: (config: LlmConfig) => void
   setProviderConfigs: (configs: ProviderConfigs) => void
+  setCustomLlmPresets: (presets: CustomLlmPreset[]) => void
   setActivePresetId: (id: string | null) => void
+  setTaskModelRouting: (config: TaskModelRoutingConfig) => void
+  setProjectLlmOverride: (config: ProjectLlmOverride) => void
   setSearchApiConfig: (config: SearchApiConfig) => void
   setEmbeddingConfig: (config: EmbeddingConfig) => void
   setMultimodalConfig: (config: MultimodalConfig) => void
@@ -337,19 +472,25 @@ interface WikiState {
   setProxyConfig: (config: ProxyConfig) => void
   setScheduledImportConfig: (config: ScheduledImportConfig) => void
   setSourceWatchConfig: (config: SourceWatchConfig) => void
+  setSourceWatchAllProjects: (enabled: boolean) => void
+  setMineruConfig: (config: MineruConfig) => void
   setApiConfig: (config: ApiConfig) => void
   setGeneralConfig: (config: GeneralConfig) => void
+  setGraphUiState: (state: GraphUiState | ((current: GraphUiState) => GraphUiState)) => void
+  resetGraphUiState: () => void
   bumpDataVersion: () => void
 }
 
 export const useWikiStore = create<WikiState>((set) => ({
   project: null,
   fileTree: [],
+  projectPathIndex: createEmptyProjectPathIndex(),
   selectedFile: null,
   fileContent: "",
+  previewContentPath: null,
   externalPreview: null,
+  previewReturnView: null,
   pendingScrollImageSrc: null,
-  chatExpanded: false,
   activeView: "wiki",
   llmConfig: {
     provider: "openai",
@@ -360,20 +501,79 @@ export const useWikiStore = create<WikiState>((set) => ({
     customEndpoint: "",
     azureApiVersion: "2024-10-21",
     reasoning: { mode: "auto" },
+    localCliIsolation: false,
+  },
+  globalLlmConfig: {
+    provider: "openai",
+    apiKey: "",
+    maxContextSize: 204800,
+    model: "",
+    ollamaUrl: "http://localhost:11434",
+    customEndpoint: "",
+    azureApiVersion: "2024-10-21",
+    reasoning: { mode: "auto" },
+    localCliIsolation: false,
   },
   providerConfigs: {},
+  customLlmPresets: [],
   activePresetId: null,
+  taskModelRouting: {
+    chatPresetId: null,
+    ingestPresetId: null,
+  },
+  projectLlmOverride: {
+    enabled: false,
+    presetId: null,
+    model: "",
+    profile: undefined,
+  },
 
   dataVersion: 0,
 
   setProject: (project) => set({ project }),
-  setFileTree: (fileTree) => set({ fileTree }),
-  setSelectedFile: (selectedFile) => set({ selectedFile, externalPreview: null }),
+  setFileTree: (fileTree, options) => {
+    if (options?.syncPathIndex === false) {
+      set({ fileTree })
+      return
+    }
+    set({ fileTree, projectPathIndex: buildProjectPathIndexFromTree(fileTree) })
+  },
+  setProjectPathIndexFromTree: (tree) =>
+    set({ projectPathIndex: buildProjectPathIndexFromTree(tree) }),
+  setSelectedFile: (selectedFile) =>
+    set({ selectedFile, previewContentPath: null, externalPreview: null }),
   setFileContent: (fileContent) => set({ fileContent }),
+  openPathInPreview: (selectedFile) =>
+    set((state) => ({
+      selectedFile,
+      previewContentPath: null,
+      externalPreview: null,
+      activeView: "wiki",
+      previewReturnView:
+        state.activeView === "wiki" ? state.previewReturnView : state.activeView,
+    })),
+  openFileInPreview: (selectedFile, fileContent) =>
+    set((state) => ({
+      selectedFile,
+      fileContent,
+      previewContentPath: selectedFile,
+      externalPreview: null,
+      activeView: "wiki",
+      previewReturnView:
+        state.activeView === "wiki" ? state.previewReturnView : state.activeView,
+    })),
+  closePreview: () =>
+    set((state) => ({
+      selectedFile: null,
+      fileContent: "",
+      previewContentPath: null,
+      externalPreview: null,
+      activeView: state.previewReturnView ?? "wiki",
+      previewReturnView: null,
+    })),
   setExternalPreview: (externalPreview) => set({ externalPreview }),
   setPendingScrollImageSrc: (pendingScrollImageSrc) => set({ pendingScrollImageSrc }),
-  setChatExpanded: (chatExpanded) => set({ chatExpanded }),
-  setActiveView: (activeView) => set({ activeView }),
+  setActiveView: (activeView) => set({ activeView, previewReturnView: null }),
   searchApiConfig: {
     provider: "none",
     apiKey: "",
@@ -422,6 +622,7 @@ export const useWikiStore = create<WikiState>((set) => ({
     enabled: false,
     url: "",
     bypassLocal: true,
+    acceptInvalidCerts: false,
   },
 
   scheduledImportConfig: {
@@ -432,6 +633,22 @@ export const useWikiStore = create<WikiState>((set) => ({
   },
 
   sourceWatchConfig: DEFAULT_SOURCE_WATCH_CONFIG,
+  sourceWatchAllProjects: false,
+  mineruConfig: {
+    enabled: false,
+    backend: "cloud",
+    localEndpoint: "http://127.0.0.1:8000",
+    localBackend: "hybrid-engine",
+    localEffort: "medium",
+    localParseMethod: "auto",
+    localLanguage: "ch",
+    localFormulaEnabled: true,
+    localTableEnabled: true,
+    localImageAnalysis: true,
+    localServerUrl: "",
+    token: "",
+    modelVersion: "vlm",
+  },
 
   // Default `enabled: true` preserves the pre-toggle behavior: anyone
   // who already had `LLM_WIKI_API_TOKEN` set or `apiConfig.token`
@@ -441,6 +658,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   apiConfig: {
     enabled: true,
     allowUnauthenticated: false,
+    allowLanAccess: false,
     mcpEnabled: false,
     token: "",
   },
@@ -450,9 +668,15 @@ export const useWikiStore = create<WikiState>((set) => ({
     closeBehavior: "minimize",
   },
 
+  graphUiState: createDefaultGraphUiState(),
+
   setLlmConfig: (llmConfig) => set({ llmConfig }),
+  setGlobalLlmConfig: (globalLlmConfig) => set({ globalLlmConfig }),
   setProviderConfigs: (providerConfigs) => set({ providerConfigs }),
+  setCustomLlmPresets: (customLlmPresets) => set({ customLlmPresets }),
   setActivePresetId: (activePresetId) => set({ activePresetId }),
+  setTaskModelRouting: (taskModelRouting) => set({ taskModelRouting }),
+  setProjectLlmOverride: (projectLlmOverride) => set({ projectLlmOverride }),
   setSearchApiConfig: (searchApiConfig) => set({ searchApiConfig }),
   setEmbeddingConfig: (embeddingConfig) => set({ embeddingConfig }),
   setMultimodalConfig: (multimodalConfig) => set({ multimodalConfig }),
@@ -460,8 +684,17 @@ export const useWikiStore = create<WikiState>((set) => ({
   setProxyConfig: (proxyConfig) => set({ proxyConfig }),
   setScheduledImportConfig: (scheduledImportConfig) => set({ scheduledImportConfig }),
   setSourceWatchConfig: (sourceWatchConfig) => set({ sourceWatchConfig }),
+  setSourceWatchAllProjects: (sourceWatchAllProjects) => set({ sourceWatchAllProjects }),
+  setMineruConfig: (mineruConfig) => set({ mineruConfig }),
   setApiConfig: (apiConfig) => set({ apiConfig }),
   setGeneralConfig: (generalConfig) => set({ generalConfig }),
+  setGraphUiState: (graphUiState) =>
+    set((state) => ({
+      graphUiState: typeof graphUiState === "function"
+        ? graphUiState(state.graphUiState)
+        : graphUiState,
+    })),
+  resetGraphUiState: () => set({ graphUiState: createDefaultGraphUiState() }),
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
 }))
 

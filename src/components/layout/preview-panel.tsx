@@ -10,9 +10,10 @@ import { getFileName } from "@/lib/path-utils"
 export function PreviewPanel() {
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const fileContent = useWikiStore((s) => s.fileContent)
+  const previewContentPath = useWikiStore((s) => s.previewContentPath)
   const externalPreview = useWikiStore((s) => s.externalPreview)
   const setFileContent = useWikiStore((s) => s.setFileContent)
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
+  const closePreview = useWikiStore((s) => s.closePreview)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Snapshot of what was most recently loaded from disk. Milkdown re-emits
   // `markdownUpdated` on initial parse (before the user types anything),
@@ -25,6 +26,10 @@ export function PreviewPanel() {
     if (!selectedFile) {
       setFileContent("")
       lastLoadedRef.current = ""
+      return
+    }
+    if (previewContentPath === selectedFile) {
+      lastLoadedRef.current = fileContent
       return
     }
     if (externalPreview?.path === selectedFile) {
@@ -49,7 +54,7 @@ export function PreviewPanel() {
         lastLoadedRef.current = ""
         setFileContent(`Error loading file: ${err}`)
       })
-  }, [selectedFile, externalPreview, fileContent, setFileContent])
+  }, [selectedFile, previewContentPath, externalPreview, setFileContent])
 
   const writeNow = useCallback((path: string, markdown: string, syncStore = false) => {
     writeFile(path, markdown)
@@ -106,7 +111,7 @@ export function PreviewPanel() {
           {fileName}
         </span>
         <button
-          onClick={() => setSelectedFile(null)}
+          onClick={closePreview}
           className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent"
         >
           <X className="h-3.5 w-3.5" />
@@ -125,6 +130,7 @@ export function PreviewPanel() {
             key={selectedFile}
             content={fileContent}
             onSave={handleSave}
+            filePath={selectedFile}
           />
         ) : (
           <FilePreview

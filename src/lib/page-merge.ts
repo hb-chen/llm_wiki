@@ -25,6 +25,7 @@
  */
 import { parseFrontmatter } from "./frontmatter"
 import { mergeArrayFieldsIntoContent } from "./sources-merge"
+import { normalizeMalformedWikilinks } from "./ingest-sanitize"
 
 /** Frontmatter array fields unioned across re-ingests. */
 const UNION_FIELDS = ["sources", "tags", "related"] as const
@@ -51,6 +52,7 @@ const LOCKED_FIELDS = ["type", "title", "created"] as const
  * compression while catching obvious truncation / lazy summaries.
  */
 const BODY_SHRINK_THRESHOLD = 0.7
+const HTTP_URL_RE = /https?:\/\/[^\s<>"'\])]+/gi
 
 export interface MergeFn {
   /**
@@ -84,6 +86,11 @@ export interface MergePageOptions {
   /** Date provider for the `updated` field. Injectable for
    *  deterministic tests. Defaults to today's UTC date. */
   today?: () => string
+  /**
+   * Replace the old body after a corrected source is regenerated, while
+   * retaining union fields, locked metadata, and a recovery backup.
+   */
+  replaceExistingBody?: boolean
 }
 
 export async function mergePageContent(
@@ -93,11 +100,11 @@ export async function mergePageContent(
   opts: MergePageOptions,
 ): Promise<string> {
   // Fast path 1: brand-new page.
-  if (!existingContent) return newContent
+  if (!existingContent) return normalizeMalformedWikilinks(newContent)
 
   // Fast path 2: byte-identical — re-ingest of the same source file
   // with no actual change. Stable reference helps callers.
-  if (newContent === existingContent) return existingContent
+  if (newContent === existingContent) return normalizeMalformedWikilinks(existingContent)
 
   // Step 1 — always-on: union the array frontmatter fields.
   const arrayMerged = mergeArrayFieldsIntoContent(
@@ -111,8 +118,23 @@ export async function mergePageContent(
   // skip the LLM.
   const oldParsed = parseFrontmatter(existingContent)
   const arrayMergedParsed = parseFrontmatter(arrayMerged)
+  if (opts.replaceExistingBody) {
+    await tryBackup(opts, existingContent)
+    let replacement = arrayMerged
+    for (const field of LOCKED_FIELDS) {
+      const existingValue = oldParsed.frontmatter?.[field]
+      if (typeof existingValue === "string" && existingValue !== "") {
+        replacement = setFrontmatterScalar(replacement, field, existingValue)
+      }
+    }
+    return normalizeMalformedWikilinks(setFrontmatterScalar(
+      replacement,
+      "updated",
+      (opts.today ?? defaultToday)(),
+    ))
+  }
   if (oldParsed.body.trim() === arrayMergedParsed.body.trim()) {
-    return arrayMerged
+    return normalizeMalformedWikilinks(arrayMerged)
   }
 
   // Step 2 — ask the merger to produce a unified body. Failures fall
@@ -130,7 +152,7 @@ export async function mergePageContent(
       `[page-merge] LLM merge failed for ${opts.pagePath}, falling back to incoming + array-field union: ${err instanceof Error ? err.message : err}`,
     )
     await tryBackup(opts, existingContent)
-    return arrayMerged
+    return normalizeMalformedWikilinks(arrayMerged)
   }
 
   // Sanity 1: LLM output must parse as a frontmatter-bearing wiki
@@ -141,7 +163,7 @@ export async function mergePageContent(
       `[page-merge] LLM output for ${opts.pagePath} has no frontmatter — rejecting, falling back`,
     )
     await tryBackup(opts, existingContent)
-    return arrayMerged
+    return normalizeMalformedWikilinks(arrayMerged)
   }
 
   // Sanity 2: body length. Reject obvious truncation / lazy summary.
@@ -154,8 +176,14 @@ export async function mergePageContent(
       `[page-merge] LLM merge for ${opts.pagePath} produced body ${llmBodyLen} chars, below threshold ${minThreshold.toFixed(0)} (max input was ${Math.max(oldBodyLen, newBodyLen)}) — rejecting, falling back`,
     )
     await tryBackup(opts, existingContent)
-    return arrayMerged
+    return normalizeMalformedWikilinks(arrayMerged)
   }
+
+  llmOutput = removeIntroducedReservedExampleUrls(
+    llmOutput,
+    existingContent,
+    arrayMerged,
+  )
 
   // Step 3 — apply deterministic post-processing: lock fields back
   // to existing values, force array fields to the union, set
@@ -177,7 +205,257 @@ export async function mergePageContent(
   const todayFn = opts.today ?? defaultToday
   final = setFrontmatterScalar(final, "updated", todayFn())
 
-  return final
+  return normalizeMalformedWikilinks(
+    stripBodyWikilinkPathPrefixes(
+      stripMergeScaffolding(final, [existingContent, arrayMerged]),
+    ),
+  )
+}
+
+interface ReservedUrlMatch {
+  canonical: string
+  raw: string
+  start: number
+  end: number
+}
+
+function reservedExampleUrls(content: string): ReservedUrlMatch[] {
+  const urls: ReservedUrlMatch[] = []
+  for (const match of content.matchAll(HTTP_URL_RE)) {
+    if (match.index === undefined) continue
+    const raw = match[0].replace(/[.,;:!?]+$/, "")
+    try {
+      const parsed = new URL(raw)
+      const host = parsed.hostname.replace(/\.$/, "").toLowerCase()
+      if (["example.com", "example.org", "example.net"].some(
+        (domain) => host === domain || host.endsWith(`.${domain}`),
+      )) urls.push({
+        canonical: parsed.toString(),
+        raw,
+        start: match.index,
+        end: match.index + raw.length,
+      })
+    } catch {
+      // Invalid URLs are left to the ordinary Markdown/content validators.
+    }
+  }
+  return urls
+}
+
+function removeIntroducedReservedExampleUrls(
+  output: string,
+  existing: string,
+  incoming: string,
+): string {
+  const inputUrls = new Set([
+    ...reservedExampleUrls(existing).map((match) => match.canonical),
+    ...reservedExampleUrls(incoming).map((match) => match.canonical),
+  ])
+  const introduced = reservedExampleUrls(output)
+    .filter((match) => !inputUrls.has(match.canonical))
+  if (introduced.length === 0) return output
+  console.warn("[page-merge] removed invented reserved example-domain URL(s) from merge output")
+  const introducedUrls = new Set(introduced.map((match) => match.canonical))
+  const frontmatter = output.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)
+  const prefix = frontmatter?.[0] ?? ""
+  const body = output.slice(prefix.length)
+  let fence: { marker: string; length: number } | null = null
+  const cleanedBody = body.split(/(\r?\n)/).map((part) => {
+    if (/^\r?\n$/.test(part)) return part
+    const marker = part.match(/^ {0,3}(`{3,}|~{3,})/)
+    if (marker) {
+      if (!fence) fence = { marker: marker[1][0], length: marker[1].length }
+      else if (
+        marker[1][0] === fence.marker &&
+        marker[1].length >= fence.length &&
+        part.slice(marker[0].length).trim() === ""
+      ) fence = null
+      return part
+    }
+    if (fence || /^(?: {4}|\t)/.test(part)) return part
+
+    const shouldRemove = (raw: string): boolean => {
+      try {
+        return introducedUrls.has(new URL(raw.replace(/[.,;:!?]+$/, "")).toString())
+      } catch {
+        return false
+      }
+    }
+    let line = part.replace(
+      /!?\[([^\]\r\n]+)\]\((https?:\/\/[^\s<>")]+)(?:\s+["'][^"']*["'])?\)/gi,
+      (whole, label: string, url: string) => shouldRemove(url) ? label : whole,
+    )
+    line = line.replace(/<(https?:\/\/[^\s<>]+)>/gi, (whole, url: string) => (
+      shouldRemove(url) ? "" : whole
+    ))
+    line = line.replace(HTTP_URL_RE, (url) => shouldRemove(url) ? "" : url)
+    if (/^\s*\[[^\]]+\]:\s*$/.test(line) || /^\s*[-*+]\s*$/.test(line)) return ""
+    return line.replace(/[ \t]+$/, "")
+  }).join("")
+  return `${prefix}${cleanedBody}`
+}
+
+export function stripMergeScaffolding(
+  content: string,
+  protectedInputs: string[] = [],
+): string {
+  const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)
+  const prefix = frontmatter?.[0] ?? ""
+  const body = content.slice(prefix.length)
+  let fence: { marker: string; length: number } | null = null
+  const label = "(?:现有|新生成|新|原始|旧|已有)(?:内容|版本|材料)(?:的?(?:定义|说明|描述))?|(?:补充材料|此前收集的材料)|(?:existing|newly generated|new|original|old|incoming|additional|previously collected) (?:content|version|material)(?: (?:definition|description))?"
+  const sourceNote = new RegExp(
+    `^[ \\t]*(?:[-*][ \\t]*)?\\*?[（(]?[ \\t]*(?:来源|source)[ \\t]*[:：][ \\t]*(?:${label})[ \\t]*[）)]?\\*?[ \\t]*$`,
+    "i",
+  )
+  const bracketedSuffix = new RegExp(`[ \\t]*[（(【][ \\t]*(?:${label})[ \\t]*[）)】][ \\t]*$`, "i")
+  const bareSuffix = new RegExp(`^(#{1,6}\\s+.+?)[ \\t]+[-—:][ \\t]*(?:${label})[ \\t]*$`, "i")
+  const protectedLines = new Set(
+    protectedInputs.flatMap((input) => input.split(/\r?\n/).map((line) => line.trim())),
+  )
+  const protectedHeadings = new Set(
+    protectedInputs.flatMap((input) => input.split(/\r?\n/))
+      .map((line) => line.match(/^#{1,6}\s+(.+?)\s*$/)?.[1])
+      .filter((heading): heading is string => Boolean(heading)),
+  )
+  const cleanedBody = body.replace(/.*(?:\r?\n|$)/g, (line) => {
+    const lineContent = line.replace(/\r?\n$/, "")
+    const newline = line.slice(lineContent.length)
+    const marker = lineContent.match(/^ {0,3}(`{3,}|~{3,})/)
+    if (marker) {
+      if (!fence) fence = { marker: marker[1][0], length: marker[1].length }
+      else if (
+        marker[1][0] === fence.marker &&
+        marker[1].length >= fence.length &&
+        lineContent.slice(marker[0].length).trim() === ""
+      ) fence = null
+      return line
+    }
+    if (fence || /^(?: {4}|\t)/.test(lineContent)) return line
+    if (protectedLines.has(lineContent.trim())) return line
+    if (sourceNote.test(lineContent)) return ""
+    if (!/^#{1,6}\s+/.test(lineContent)) return line
+    const headingText = lineContent.replace(/^#{1,6}\s+/, "").trim()
+    if (protectedHeadings.has(headingText)) return line
+    const withoutBracket = lineContent.replace(bracketedSuffix, "")
+    const withoutBare = withoutBracket.replace(bareSuffix, "$1")
+    return `${withoutBare}${newline}`
+  })
+  return `${prefix}${cleanedBody}`
+}
+
+/**
+ * Normalize page links after an LLM merge without touching frontmatter,
+ * prose paths, code examples, or Obsidian image/file embeds.
+ *
+ * Project schemas route pages into directories on disk, but cross-page links
+ * use bare slugs. Older page bodies may still contain targets such as
+ * `[[clients/foo-overview]]`; merge prompts intentionally preserve existing
+ * links, so the application must repair those targets deterministically.
+ */
+export function stripBodyWikilinkPathPrefixes(content: string): string {
+  const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)
+  if (!frontmatter) return content
+
+  const body = content.slice(frontmatter[0].length)
+  if (!body.includes("[[")) return content
+
+  const normalizedBody = normalizeWikilinksOutsideCode(body)
+
+  return `${frontmatter[0]}${normalizedBody}`
+}
+
+function normalizeWikilinksOutsideCode(body: string): string {
+  let fence: { marker: "`" | "~"; length: number } | null = null
+
+  return body.replace(/.*(?:\r?\n|$)/g, (line) => {
+    const content = line.replace(/\r?\n$/, "")
+    const markerMatch = content.match(/^ {0,3}(`{3,}|~{3,})/)
+    if (markerMatch) {
+      const marker = markerMatch[1][0] as "`" | "~"
+      const length = markerMatch[1].length
+      if (!fence) fence = { marker, length }
+      else if (
+        marker === fence.marker &&
+        length >= fence.length &&
+        content.slice(markerMatch[0].length).trim() === ""
+      ) {
+        fence = null
+      }
+      return line
+    }
+    if (fence || /^(?: {4}|\t)/.test(content)) return line
+
+    return replaceOutsideInlineCode(line)
+  })
+}
+
+function replaceOutsideInlineCode(text: string): string {
+  let output = ""
+  let cursor = 0
+
+  while (cursor < text.length) {
+    const opening = text.indexOf("`", cursor)
+    if (opening < 0) return output + replaceWikilinkPrefixes(text.slice(cursor))
+
+    output += replaceWikilinkPrefixes(text.slice(cursor, opening))
+    let runEnd = opening + 1
+    while (text[runEnd] === "`") runEnd += 1
+    const delimiter = text.slice(opening, runEnd)
+    const closing = text.indexOf(delimiter, runEnd)
+    if (closing < 0) {
+      // An unmatched run is ordinary Markdown text, not an inline code span.
+      output += replaceWikilinkPrefixes(text.slice(opening, runEnd))
+      cursor = runEnd
+      continue
+    }
+
+    output += text.slice(opening, closing + delimiter.length)
+    cursor = closing + delimiter.length
+  }
+
+  return output
+}
+
+const PAGE_WIKILINK_RE = /\[\[([^\]|\n]+)(?:\|([^\]\n]*))?\]\]/g
+
+function replaceWikilinkPrefixes(text: string): string {
+  return text.replace(
+    PAGE_WIKILINK_RE,
+    (match, rawTarget: string, rawAlias: string | undefined, offset: number) => {
+      if (offset > 0 && text[offset - 1] === "!") return match
+      const preceding = text.slice(0, offset).match(/\\+$/)?.[0].length ?? 0
+      if (preceding % 2 === 1) return match
+
+      const target = rawTarget.trim()
+      const normalizedTarget = bareWikilinkTarget(target)
+      if (normalizedTarget === target) return match
+
+      const alias = rawAlias === undefined ? "" : `|${rawAlias}`
+      return `[[${normalizedTarget}${alias}]]`
+    },
+  )
+}
+
+function bareWikilinkTarget(target: string): string {
+  if (!target || target.startsWith("#")) return target
+  // URI-like targets are not wiki page paths.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return target
+
+  const fragmentIndex = target.indexOf("#")
+  const pageTarget = fragmentIndex >= 0 ? target.slice(0, fragmentIndex) : target
+  const fragment = fragmentIndex >= 0 ? target.slice(fragmentIndex) : ""
+  const normalizedPath = pageTarget.replace(/\\/g, "/")
+  if (!normalizedPath.includes("/")) return target
+
+  const leaf = normalizedPath.split("/").pop()
+  if (!leaf) return target
+  const extensionIndex = leaf.lastIndexOf(".")
+  if (extensionIndex > 0 && leaf.slice(extensionIndex).toLowerCase() !== ".md") {
+    return target
+  }
+
+  return `${leaf}${fragment}`
 }
 
 async function tryBackup(

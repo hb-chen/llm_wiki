@@ -8,7 +8,7 @@
  * actual generation model.
  */
 import { describe, it, expect, vi } from "vitest"
-import { mergePageContent } from "./page-merge"
+import { mergePageContent, stripMergeScaffolding } from "./page-merge"
 
 const PAGE = (fm: string, body: string) => `---\n${fm}\n---\n\n${body}`
 
@@ -44,6 +44,14 @@ describe("mergePageContent — fast paths", () => {
     expect(merger).not.toHaveBeenCalled()
   })
 
+  it("repairs malformed citations on an otherwise byte-identical page", async () => {
+    const merger = vi.fn()
+    const content = PAGE("type: entity\ntitle: Foo", "Evidence [[1]].")
+    const out = await mergePageContent(content, content, merger, baseOpts)
+    expect(out).toContain("Evidence [1].")
+    expect(merger).not.toHaveBeenCalled()
+  })
+
   it("skips LLM when bodies are identical (only sources differ)", async () => {
     // Re-ingest of the same file from a different source just adds
     // its source filename — body is byte-identical. Don't waste an
@@ -61,6 +69,58 @@ describe("mergePageContent — fast paths", () => {
     expect(out).toContain('sources: ["a.pdf", "b.pdf"]')
     expect(out).toContain("same body")
     expect(merger).not.toHaveBeenCalled()
+  })
+})
+
+describe("mergePageContent — corrected single-source replacement", () => {
+  it("replaces only the body while preserving metadata, arrays, and backup", async () => {
+    const existing = PAGE(
+      'type: entity\ntitle: Stable title\ncreated: 2025-01-01\nupdated: 2025-01-02\nsources: ["doc.pdf"]\ntags: [manual]\nrelated: [kept-link]',
+      "obsolete source wording plus a manual-era body",
+    )
+    const incoming = PAGE(
+      'type: concept\ntitle: Changed title\ncreated: 2026-01-01\nsources: ["doc.pdf"]\ntags: [generated]\nrelated: [new-link]',
+      "corrected source wording",
+    )
+    const merger = vi.fn()
+    const backup = vi.fn().mockResolvedValue(undefined)
+
+    const out = await mergePageContent(incoming, existing, merger, {
+      ...baseOpts,
+      replaceExistingBody: true,
+      backup,
+    })
+
+    expect(out).toContain("corrected source wording")
+    expect(out).not.toContain("obsolete source wording")
+    expect(out).toContain("type: entity")
+    expect(out).toContain("title: Stable title")
+    expect(out).toContain("created: 2025-01-01")
+    expect(out).toContain("updated: 2026-04-30")
+    expect(out).toMatch(/tags:\s*\[\s*"manual",\s*"generated"\s*\]/)
+    expect(out).toMatch(/related:\s*\[\s*"kept-link",\s*"new-link"\s*\]/)
+    expect(backup).toHaveBeenCalledWith(existing)
+    expect(merger).not.toHaveBeenCalled()
+  })
+
+  it("keeps normal merge behavior for a page with another source", async () => {
+    const existing = PAGE(
+      'type: entity\ntitle: Shared\nsources: ["doc.pdf", "other.pdf"]',
+      "other source contribution",
+    )
+    const incoming = PAGE(
+      'type: entity\ntitle: Shared\nsources: ["doc.pdf"]',
+      "corrected doc contribution",
+    )
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      'type: entity\ntitle: Shared\nsources: ["doc.pdf", "other.pdf"]',
+      "other source contribution and corrected doc contribution retained together",
+    ))
+
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(merger).toHaveBeenCalledOnce()
+    expect(out).toContain("other source contribution")
+    expect(out).toContain("corrected doc contribution")
   })
 })
 
@@ -129,6 +189,215 @@ describe("mergePageContent — LLM merge", () => {
     const out = await mergePageContent(incoming, existing, merger, baseOpts)
     expect(out).toContain("type: entity")
     expect(out).not.toContain("type: concept")
+  })
+
+  it("normalizes malformed citations introduced by the merge model", async () => {
+    const existing = PAGE("type: entity\ntitle: Foo", "Existing detailed evidence for the topic.")
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      "Existing and incoming evidence are retained [[1]] with sources [[2], [3]].",
+    ))
+
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(out).toContain("retained [1] with sources [2], [3].")
+  })
+
+  it("strips internal version labels from accepted merged content", async () => {
+    const existing = PAGE("type: entity\ntitle: Foo", "Existing detailed evidence for the topic.")
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      "## Classification（新生成版本）\n\nRetained evidence.\n\n*（来源：现有版本）*",
+    ))
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(out).toContain("## Classification")
+    expect(out).not.toMatch(/新生成版本|现有版本/)
+  })
+
+  it("removes reserved example-domain URLs invented by the merge model", async () => {
+    const existing = PAGE("type: entity\ntitle: Foo", "Existing detailed evidence for the topic.")
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      "Existing and incoming evidence retained in detail.\n\n## References\n- https://example.com/version1",
+    ))
+    const backup = vi.fn().mockResolvedValue(undefined)
+    const out = await mergePageContent(incoming, existing, merger, { ...baseOpts, backup })
+    expect(out).toContain("Existing and incoming evidence retained in detail.")
+    expect(out).not.toContain("example.com")
+    expect(backup).not.toHaveBeenCalled()
+  })
+
+  it("removes only the invented URL range and preserves legitimate longer URLs", async () => {
+    const legitimate = "https://example.com/docs/v1/guide"
+    const existing = PAGE("type: entity\ntitle: Foo", `Existing evidence at ${legitimate}.`)
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      `Existing evidence at ${legitimate}.\n\nIncoming detailed evidence.\n\n[Invented citation](https://example.com/docs/v1)`,
+    ))
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(out).toContain(legitimate)
+    expect(out).toContain("Invented citation")
+    expect(out).not.toContain("[Invented citation]()")
+    expect(out).not.toContain("https://example.com/docs/v1)")
+  })
+
+  it("preserves lookalike domains while removing reserved subdomains", async () => {
+    const existing = PAGE("type: entity\ntitle: Foo", "Existing detailed evidence for the topic.")
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      [
+        "Existing and incoming evidence retained in detail.",
+        "https://notexample.com/reference",
+        "https://example.com.evil.test/reference",
+        "<https://docs.example.org/invented>",
+      ].join("\n"),
+    ))
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(out).toContain("https://notexample.com/reference")
+    expect(out).toContain("https://example.com.evil.test/reference")
+    expect(out).not.toContain("docs.example.org")
+    expect(out).not.toContain("<>")
+  })
+
+  it("preserves version-labelled headings that were already in source material", async () => {
+    const existing = PAGE("type: entity\ntitle: Foo", "## 旧版本\n\nHistorical product edition details.")
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      "## 旧版本\n\nHistorical product edition details.\n\n## Analysis（新生成版本）\n\nIncoming detailed evidence.",
+    ))
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(out).toContain("## 旧版本")
+    expect(out).toContain("## Analysis\n")
+    expect(out).not.toContain("Analysis（新生成版本）")
+  })
+
+  it("preserves legitimate version headings when the model changes heading depth", async () => {
+    const existing = PAGE("type: entity\ntitle: Foo", "## iPhone 12 (old version)\n\nHistorical product details.")
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      "### iPhone 12 (old version)\n\nHistorical product details.\n\nIncoming detailed evidence.",
+    ))
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(out).toContain("### iPhone 12 (old version)")
+  })
+
+  it("cleans invented Markdown URL forms without changing fenced examples", async () => {
+    const existing = PAGE("type: entity\ntitle: Foo", "Existing detailed evidence for the topic.")
+    const incoming = PAGE("type: entity\ntitle: Foo", "Incoming detailed evidence for the topic.")
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      "type: entity\ntitle: Foo",
+      [
+        "Existing and incoming evidence retained in detail.",
+        "![diagram](https://example.com/image.png)",
+        "[citation](https://example.org/page \"Title\")",
+        "[1]: https://example.net/reference",
+        "- https://example.com/bare",
+        "```sh",
+        "curl https://api.example.com/example",
+        "```",
+      ].join("\n"),
+    ))
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(out).toContain("diagram")
+    expect(out).toContain("citation")
+    expect(out).not.toContain("!diagram")
+    expect(out).not.toContain("[citation](")
+    expect(out).not.toMatch(/^\[1\]:\s*$/m)
+    expect(out).not.toMatch(/^[-*+]\s*$/m)
+    expect(out).toContain("curl https://api.example.com/example")
+  })
+
+  it("strips directory prefixes from merged body wikilinks only", async () => {
+    const existing = PAGE(
+      "type: entity\ntitle: Foo",
+      "Existing notes link to [[clients/foo-overview]] and contain enough detail for merging.",
+    )
+    const incoming = PAGE(
+      "type: entity\ntitle: Foo",
+      "Incoming notes add a second detailed observation about the same subject.",
+    )
+    const mergedBody = [
+      "Existing and incoming notes are retained with additional context.",
+      "See [[clients/foo-overview]], [[concepts/bar#Details|Bar details]], and [[windows\\baz]].",
+      "Keep the ordinary path clients/foo-overview unchanged.",
+      "Keep the embed ![[media/charts/plot.png]] unchanged.",
+      "Keep inline code `[[examples/inline-link]]` unchanged.",
+      "Keep multi-backtick code ``[[examples/multi-backtick]]`` unchanged.",
+      "```md",
+      "[[examples/fenced-link]]",
+      "```not-a-closing-fence",
+      "[[examples/still-fenced-link]]",
+      "```",
+      "~~~md",
+      "[[examples/tilde-fenced-link]]",
+      "~~~",
+      "    [[examples/indented-code-link]]",
+      "Keep escaped \\[[examples/escaped-link]] unchanged.",
+      "Keep URI-like [[https://developer.mozilla.org/wiki/page]] targets unchanged.",
+      "Keep attachment [[attachments/report.pdf]] targets unchanged.",
+    ].join("\n")
+    const merger = vi.fn().mockResolvedValue(
+      PAGE("type: entity\ntitle: Foo", mergedBody),
+    )
+
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+
+    expect(out).toContain("[[foo-overview]]")
+    expect(out).toContain("[[bar#Details|Bar details]]")
+    expect(out).toContain("[[baz]]")
+    expect(out).not.toContain("[[clients/foo-overview]]")
+    expect(out).toContain("ordinary path clients/foo-overview unchanged")
+    expect(out).toContain("![[media/charts/plot.png]]")
+    expect(out).toContain("`[[examples/inline-link]]`")
+    expect(out).toContain("``[[examples/multi-backtick]]``")
+    expect(out).toContain("[[examples/fenced-link]]")
+    expect(out).toContain("[[examples/still-fenced-link]]")
+    expect(out).toContain("[[examples/tilde-fenced-link]]")
+    expect(out).toContain("    [[examples/indented-code-link]]")
+    expect(out).toContain("\\[[examples/escaped-link]]")
+    expect(out).toContain("[[https://developer.mozilla.org/wiki/page]]")
+    expect(out).toContain("[[attachments/report.pdf]]")
+  })
+})
+
+describe("stripMergeScaffolding", () => {
+  it("removes source-version notes and heading labels without changing factual prose", () => {
+    const input = [
+      "## 分类标准（新生成版本）",
+      "",
+      "事实内容。",
+      "",
+      "*（来源：原始版本）*",
+      "",
+      "### GAP-3 — 旧版本",
+    ].join("\n")
+    expect(stripMergeScaffolding(input)).toBe([
+      "## 分类标准",
+      "",
+      "事实内容。",
+      "",
+      "",
+      "### GAP-3",
+    ].join("\n"))
+  })
+
+  it.each([
+    "The threshold (threshold = 0.5) remains factual.",
+    "Values (gold standard) hold.",
+    "The model (original paper by Smith) reported 90%.",
+    "该方法（原始数据集）准确率 90%。",
+    "[[page (old version)]]",
+    "```js\nfoo(old_value)\n```",
+    "---\ntitle: Foo (old)\nsources: [report (original).pdf]\n---\nBody",
+    "## 旧版本",
+  ])("preserves non-scaffolding content byte-identically: %s", (input) => {
+    expect(stripMergeScaffolding(input)).toBe(input)
   })
 })
 

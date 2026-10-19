@@ -58,12 +58,14 @@
 export function sanitizeIngestedFileContent(content: string): string {
   let cleaned = content
 
-  // (1) Strip an outer code fence wrapping the whole document.
+  // (1) Strip a code fence wrapping the whole document or just its
+  // frontmatter block.
   // We only act when the FIRST non-empty line is an opening fence
   // (`\`\`\`yaml`, `\`\`\`md`, `\`\`\`markdown`, or just `\`\`\``)
-  // AND the LAST non-empty line is a matching closing fence. This
-  // avoids touching pages that legitimately end with an unclosed
-  // fence (we don't try to "fix" mid-stream truncation here).
+  // with a matching close either at the end of the document or directly
+  // after a complete frontmatter block. This avoids touching pages that
+  // legitimately start with an unclosed fence (we don't try to "fix"
+  // mid-stream truncation here).
   cleaned = stripOuterCodeFence(cleaned)
 
   // (2) Strip a stray `frontmatter:` line that prefixes the real
@@ -83,20 +85,127 @@ export function sanitizeIngestedFileContent(content: string): string {
   // link transform applied at read time.
   cleaned = repairWikilinkListsInFrontmatter(cleaned)
 
+  // (4) Normalize recurring malformed body links emitted by generation and
+  // synthesis models. Frontmatter and code examples remain byte-identical.
+  cleaned = normalizeMalformedWikilinks(cleaned)
+
   return cleaned
 }
 
-/** Top-level fence wrapper. Removes the open + close fence lines. */
+export function normalizeMalformedWikilinks(content: string): string {
+  const bom = content.startsWith("\uFEFF") ? "\uFEFF" : ""
+  const withoutBom = content.slice(bom.length)
+  const frontmatter = withoutBom.match(
+    /^---[ \t]*\r?\n(?:---[ \t]*(?:\r?\n|$)|[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$))/,
+  )
+  const prefix = `${bom}${frontmatter?.[0] ?? ""}`
+  const body = withoutBom.slice(frontmatter?.[0].length ?? 0)
+  if (!body.includes("[[")) return content
+
+  let fence: { marker: "`" | "~"; length: number } | null = null
+  let mathFence = false
+  let htmlCodeFence = false
+  const normalized = body.replace(/.*(?:\r?\n|$)/g, (line) => {
+    const lineContent = line.replace(/\r?\n$/, "")
+    const markerMatch = lineContent.match(/^ {0,3}(?:>\s*)*(`{3,}|~{3,})/)
+    if (markerMatch) {
+      const marker = markerMatch[1][0] as "`" | "~"
+      const length = markerMatch[1].length
+      if (!fence) fence = { marker, length }
+      else if (
+        marker === fence.marker &&
+        length >= fence.length &&
+        lineContent.slice(markerMatch[0].length).trim() === ""
+      ) fence = null
+      return line
+    }
+    if (fence) return line
+    const trimmed = lineContent.trim()
+    if (trimmed === "$$") {
+      mathFence = !mathFence
+      return line
+    }
+    if (mathFence) return line
+    if (/<(?:pre|code)\b/i.test(lineContent)) htmlCodeFence = true
+    if (htmlCodeFence) {
+      if (/<\/(?:pre|code)>/i.test(lineContent)) htmlCodeFence = false
+      return line
+    }
+    const indented = /^(?: {4}|\t)/.test(lineContent)
+    const nestedList = /^(?: {4}|\t)(?:[-+*]|\d+[.)])\s+/.test(lineContent)
+    if (indented && !nestedList) return line
+    return normalizeMalformedLinksOutsideInlineCode(line)
+  })
+  return `${prefix}${normalized}`
+}
+
+function normalizeMalformedLinksOutsideInlineCode(text: string): string {
+  let output = ""
+  let cursor = 0
+  while (cursor < text.length) {
+    const opening = text.indexOf("`", cursor)
+    if (opening < 0) return output + normalizeMalformedLinkSegment(text.slice(cursor))
+    output += normalizeMalformedLinkSegment(text.slice(cursor, opening))
+    let runEnd = opening + 1
+    while (text[runEnd] === "`") runEnd++
+    const delimiter = text.slice(opening, runEnd)
+    const closing = text.indexOf(delimiter, runEnd)
+    if (closing < 0) {
+      output += normalizeMalformedLinkSegment(text.slice(opening, runEnd))
+      cursor = runEnd
+      continue
+    }
+    output += text.slice(opening, closing + delimiter.length)
+    cursor = closing + delimiter.length
+  }
+  return output
+}
+
+function normalizeMalformedLinkSegment(segment: string): string {
+  const citationPattern = /\[\[(\d+\](?:\s*,\s*\[\d+\])*)\]/g
+  let normalized = segment.replace(
+    citationPattern,
+    (match, citations: string, offset: number) => {
+      if (offset > 0 && (segment[offset - 1] === "!" || segment[offset - 1] === "[")) {
+        return match
+      }
+      if (segment[offset + match.length] === "(") return match
+      const numbers = citations.match(/\d+/g) ?? []
+      if (numbers.some((value) => value.length > 3)) return match
+      return `[${citations}`
+    },
+  )
+  if (normalized.includes("](")) return normalized
+  return normalized.replace(
+    /\[\[([^\]|\n]+)\|([^\]\n]+)\](?!\])/g,
+    (match, target: string, alias: string, offset: number) => {
+      if (offset > 0 && normalized[offset - 1] === "!") return match
+      return `[[${target}|${alias}]]`
+    },
+  )
+}
+
+/** Top-level fence wrapper. Removes the open + matching close fence lines. */
 function stripOuterCodeFence(content: string): string {
-  const open = content.match(/^[ \t]*```(?:yaml|md|markdown)?[ \t]*\r?\n/)
+  const open = content.match(
+    /^(?:\uFEFF)?(?:[ \t]*\r?\n)*[ \t]*```(?:yaml|md|markdown)?[ \t]*\r?\n/i,
+  )
   if (!open) return content
   const afterOpen = content.slice(open[0].length)
 
   // Closing fence: a final ``` on its own line, ignoring trailing
   // whitespace/newlines after it.
   const close = afterOpen.match(/\r?\n[ \t]*```[ \t]*\r?\n?\s*$/)
-  if (!close) return content
-  return afterOpen.slice(0, close.index)
+  if (close) return afterOpen.slice(0, close.index)
+
+  // Some models close the fence immediately after the frontmatter and
+  // continue with an unfenced Markdown body. Only strip this shape when
+  // the fenced section is exactly a complete `---` frontmatter block.
+  const frontmatterOnly = afterOpen.match(
+    /^(---[ \t]*\r?\n[\s\S]*?^---[ \t]*\r?\n)[ \t]*```[ \t]*(?:\r?\n|$)/m,
+  )
+  if (!frontmatterOnly) return content
+  return frontmatterOnly[1] + afterOpen.slice(frontmatterOnly[0].length)
 }
 
 /**
@@ -141,12 +250,12 @@ function addMissingOpeningFrontmatterFence(content: string): string {
  * outside the frontmatter block are left untouched.
  */
 function repairWikilinkListsInFrontmatter(content: string): string {
-  const fmRe = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*(\r?\n|$)/
+  const fmRe = /^(---[ \t]*(\r?\n))([\s\S]*?)(\r?\n---[ \t]*(?:\r?\n|$))/
   const m = content.match(fmRe)
   if (!m) return content
 
-  const repairedPayload = m[1]
-    .split("\n")
+  const repairedPayload = m[3]
+    .split(/\r?\n/)
     .map((line) => {
       const lm = line.match(
         /^(\s*[A-Za-z_][\w-]*\s*:\s*)(\[\[[^\]]+\]\](?:\s*,\s*\[\[[^\]]+\]\])+)\s*$/,
@@ -160,13 +269,10 @@ function repairWikilinkListsInFrontmatter(content: string): string {
         .join(", ")
       return `${lm[1]}[${items}]`
     })
-    .join("\n")
+    .join(m[2])
 
-  // Replace ONLY the payload between fences; preserve the original
-  // fence lines and trailing newline shape.
-  return (
-    content.slice(0, m.index! + 4) + // up to and including "---\n"
-    repairedPayload +
-    content.slice(m.index! + 4 + m[1].length)
-  )
+  // Rebuild from captured delimiters instead of assuming the opening fence is
+  // four bytes. Windows CRLF makes `---\r\n` five bytes, and hard-coded offsets
+  // corrupt both the opening fence and the payload boundary.
+  return m[1] + repairedPayload + m[4] + content.slice(m[0].length)
 }

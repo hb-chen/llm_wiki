@@ -30,13 +30,24 @@ vi.mock("@tauri-apps/api/event", () => ({
 import {
   createClaudeCodeStreamParser,
   buildExitError,
+  createBoundedDiagnosticBuffer,
+  extractClaudeCodeStructuredError,
+  shouldCaptureClaudeDiagnostic,
   streamClaudeCodeCli,
 } from "../claude-cli-transport"
+import { useWikiStore } from "@/stores/wiki-store"
 
 beforeEach(() => {
   vi.clearAllMocks()
   tauriMocks.reset()
   tauriMocks.invoke.mockResolvedValue(undefined)
+  useWikiStore.setState({
+    project: {
+      id: "project-1",
+      name: "Project",
+      path: "/Users/me/wiki-project",
+    },
+  })
 })
 
 describe("createClaudeCodeStreamParser", () => {
@@ -195,6 +206,7 @@ describe("streamClaudeCodeCli", () => {
       expect.objectContaining({
         model: "claude-sonnet-4-6",
         messages: [{ role: "user", content: "Analyze this source." }],
+        workingDirectory: "/Users/me/wiki-project",
       }),
     )
 
@@ -226,6 +238,116 @@ describe("streamClaudeCodeCli", () => {
     expect(callbacks.onToken).toHaveBeenCalledWith("structured analysis")
     expect(callbacks.onDone).toHaveBeenCalledTimes(1)
     expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it("passes local CLI isolation preference to the Rust transport", async () => {
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    const stream = streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+        localCliIsolation: true,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    )
+
+    await vi.waitFor(() => {
+      expect(tauriMocks.invoke).toHaveBeenCalledWith(
+        "claude_cli_spawn",
+        expect.objectContaining({ isolateLocalConfig: true }),
+      )
+    })
+
+    const payload = tauriMocks.invoke.mock.calls[0]?.[1] as { streamId: string }
+    tauriMocks.emit(
+      `claude-cli:${payload.streamId}`,
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "ok" }] },
+      }),
+    )
+    tauriMocks.emit(`claude-cli:${payload.streamId}:done`, { code: 0, stderr: "" })
+
+    await stream
+  })
+
+  it("passes the active project path as the Claude CLI working directory", async () => {
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    const stream = streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    )
+
+    await vi.waitFor(() => {
+      expect(tauriMocks.invoke).toHaveBeenCalledWith(
+        "claude_cli_spawn",
+        expect.objectContaining({ workingDirectory: "/Users/me/wiki-project" }),
+      )
+    })
+
+    const payload = tauriMocks.invoke.mock.calls[0]?.[1] as { streamId: string }
+    tauriMocks.emit(
+      `claude-cli:${payload.streamId}`,
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "ok" }] },
+      }),
+    )
+    tauriMocks.emit(`claude-cli:${payload.streamId}:done`, { code: 0, stderr: "" })
+
+    await stream
+  })
+
+  it("surfaces an error without spawning when no project is active", async () => {
+    useWikiStore.setState({ project: null })
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    await streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    )
+
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith("claude_cli_spawn", expect.anything())
+    expect(tauriMocks.listen).not.toHaveBeenCalled()
+    expect(callbacks.onError).toHaveBeenCalledTimes(1)
+    expect(callbacks.onError.mock.calls[0]?.[0]).toMatchObject({
+      message: expect.stringMatching(/working directory/),
+    })
   })
 
   it("surfaces a clear error when completion has no assistant text", async () => {
@@ -329,6 +451,12 @@ describe("buildExitError", () => {
     expect(msg).toMatch(/not authenticated/i)
   })
 
+  it("recognizes OAuth authentication failures emitted on stdout", () => {
+    const msg = buildExitError(1, "", "Failed to authenticate: OAuth session expired")
+    expect(msg).toMatch(/not authenticated/i)
+    expect(msg).toContain("OAuth session expired")
+  })
+
   it("falls back to unparsed stdout when stderr is empty (the real-user case)", () => {
     // Real-user scenario: claude exit 1, stderr empty, but stdout
     // had a structured error event our parser didn't recognize.
@@ -336,8 +464,8 @@ describe("buildExitError", () => {
     // and had to grep the binary to guess what went wrong.
     const stdout = '{"type":"error","subtype":"oauth_expired","message":"token revoked"}'
     const msg = buildExitError(1, "", stdout)
-    expect(msg).toContain("code 1")
-    expect(msg).toContain("no stderr")
+    expect(msg).toMatch(/not authenticated/i)
+    expect(msg).toContain("`claude`")
     expect(msg).toContain("oauth_expired")
     expect(msg).toContain("token revoked")
   })
@@ -353,5 +481,69 @@ describe("buildExitError", () => {
     expect(msg).toMatch(/silently/)
     expect(msg).toMatch(/terminal/)
     expect(msg).toMatch(/Anthropic API/)
+  })
+})
+
+describe("extractClaudeCodeStructuredError", () => {
+  it("extracts failed result events from Claude Code", () => {
+    expect(extractClaudeCodeStructuredError(JSON.stringify({
+      type: "result",
+      is_error: true,
+      result: "Failed to authenticate: OAuth session expired",
+    }))).toBe("Failed to authenticate: OAuth session expired")
+  })
+
+  it("ignores successful result events", () => {
+    expect(extractClaudeCodeStructuredError(JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: "done",
+    }))).toBeNull()
+  })
+
+  it("extracts nested error messages", () => {
+    expect(extractClaudeCodeStructuredError(JSON.stringify({
+      type: "error",
+      error: { message: "rate limit exceeded" },
+    }))).toBe("rate limit exceeded")
+  })
+})
+
+describe("Claude CLI diagnostic buffering", () => {
+  it("ignores normal structured lifecycle and hook events", () => {
+    expect(shouldCaptureClaudeDiagnostic(JSON.stringify({
+      type: "system",
+      subtype: "hook_started",
+      message: "running hook",
+    }))).toBe(false)
+    expect(shouldCaptureClaudeDiagnostic(JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: "done",
+    }))).toBe(false)
+  })
+
+  it("keeps non-JSON and structured error diagnostics", () => {
+    expect(shouldCaptureClaudeDiagnostic("fatal process failure")).toBe(true)
+    expect(shouldCaptureClaudeDiagnostic(JSON.stringify({
+      type: "result",
+      is_error: true,
+      result: "token expired",
+    }))).toBe(true)
+  })
+
+  it("retains the newest diagnostics when capacity is exceeded", () => {
+    const buffer = createBoundedDiagnosticBuffer(12)
+    buffer.append("old-message")
+    buffer.append("FINAL-ERROR")
+    expect(buffer.value()).toContain("FINAL-ERROR")
+    expect(buffer.value()).not.toContain("old-message")
+    expect(Array.from(buffer.value()).length).toBeLessThanOrEqual(12)
+  })
+
+  it("does not split unicode code points at the capacity boundary", () => {
+    const buffer = createBoundedDiagnosticBuffer(3)
+    buffer.append("错误信息")
+    expect(buffer.value()).toBe("误信息")
   })
 })

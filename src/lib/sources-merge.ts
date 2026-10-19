@@ -34,20 +34,20 @@
  * `parseFrontmatterArray(c, "rel")` won't match `related: [...]`.
  */
 export function parseFrontmatterArray(content: string, fieldName: string): string[] {
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
   if (!fmMatch) return []
   const fm = fmMatch[1]
   // Anchor to start of line + exact field name + colon. The negative
   // lookahead-style check is done by requiring `:` immediately after.
   const escapedName = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   const blockRe = new RegExp(
-    `^${escapedName}:\\s*\\n((?:[ \\t]+-\\s+.+\\n?)+)`,
+    `^${escapedName}:\\s*\\r?\\n((?:[ \\t]+-\\s+.+(?:\\r?\\n|$))+)`,
     "m",
   )
   const block = fm.match(blockRe)
   if (block) {
     const out: string[] = []
-    for (const line of block[1].split("\n")) {
+    for (const line of block[1].split(/\r?\n/)) {
       const m = line.match(/^\s+-\s+["']?(.+?)["']?\s*$/)
       if (m && m[1]) out.push(m[1].trim())
     }
@@ -59,10 +59,45 @@ export function parseFrontmatterArray(content: string, fieldName: string): strin
   if (!inline) return []
   const body = inline[1].trim()
   if (body === "") return []
-  return body
-    .split(",")
-    .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-    .filter((s) => s.length > 0)
+  return splitInlineArray(body)
+}
+
+function splitInlineArray(body: string): string[] {
+  const out: string[] = []
+  let current = ""
+  let quote: "\"" | "'" | null = null
+  let escaped = false
+
+  for (const ch of body) {
+    if (escaped) {
+      current += ch
+      escaped = false
+      continue
+    }
+    if (quote === "\"" && ch === "\\") {
+      escaped = true
+      continue
+    }
+    if ((ch === "\"" || ch === "'") && quote === null) {
+      quote = ch
+      continue
+    }
+    if (quote === ch) {
+      quote = null
+      continue
+    }
+    if (ch === "," && quote === null) {
+      const value = current.trim()
+      if (value) out.push(value)
+      current = ""
+      continue
+    }
+    current += ch
+  }
+
+  const value = current.trim()
+  if (value) out.push(value)
+  return out
 }
 
 /**
@@ -81,12 +116,13 @@ export function writeFrontmatterArray(
   fieldName: string,
   values: string[],
 ): string {
-  const fmMatch = content.match(/^(---\n)([\s\S]*?)(\n---)/)
+  const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/)
   if (!fmMatch) return content
 
   const [, openDelim, fmBody, closeDelim] = fmMatch
+  const newline = openDelim.endsWith("\r\n") ? "\r\n" : "\n"
   const escapedName = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const serialized = values.map((s) => `"${s}"`).join(", ")
+  const serialized = values.map(quoteInlineArrayValue).join(", ")
   const newLine = `${fieldName}: [${serialized}]`
 
   // Replace inline form in place — preserves field ordering.
@@ -98,17 +134,23 @@ export function writeFrontmatterArray(
 
   // Replace block form in place, normalized to inline form.
   const blockRe = new RegExp(
-    `^${escapedName}:\\s*\\n((?:[ \\t]+-\\s+.+\\n?)+)`,
+    `^${escapedName}:\\s*\\r?\\n((?:[ \\t]+-\\s+.+(?:\\r?\\n|$))+)`,
     "m",
   )
   if (blockRe.test(fmBody)) {
-    const rewritten = fmBody.replace(blockRe, newLine)
+    const rewritten = fmBody.replace(blockRe, (matched) =>
+      `${newLine}${/\r?\n$/.test(matched) ? newline : ""}`,
+    )
     return `${openDelim}${rewritten}${closeDelim}${content.slice(fmMatch[0].length)}`
   }
 
   // Field absent — append at end of frontmatter.
-  const rewritten = `${fmBody}\n${newLine}`
+  const rewritten = `${fmBody}${newline}${newLine}`
   return `${openDelim}${rewritten}${closeDelim}${content.slice(fmMatch[0].length)}`
+}
+
+function quoteInlineArrayValue(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
 }
 
 /**
@@ -148,7 +190,7 @@ export function mergeArrayFieldsIntoContent(
   fields: readonly string[],
 ): string {
   if (!existingContent) return newContent
-  if (!/^---\n/.test(existingContent)) return newContent
+  if (!/^---\r?\n/.test(existingContent)) return newContent
 
   let result = newContent
   let changed = false

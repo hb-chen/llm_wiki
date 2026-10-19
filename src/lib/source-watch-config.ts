@@ -1,5 +1,6 @@
 import type { SourceWatchConfig } from "@/stores/wiki-store"
 import { normalizePath } from "@/lib/path-utils"
+import { clampUserConcurrency } from "@/lib/concurrency-limits"
 import sourceWatchDefaults from "@/lib/source-watch-defaults.json"
 
 export const DEFAULT_SOURCE_WATCH_CONFIG: SourceWatchConfig = sourceWatchDefaults
@@ -7,15 +8,15 @@ export const DEFAULT_SOURCE_WATCH_CONFIG: SourceWatchConfig = sourceWatchDefault
 export const SOURCE_WATCH_FILE_TYPE_GROUPS = [
   {
     id: "documents",
-    extensions: ["md", "mdx", "txt", "pdf", "doc", "docx", "odt", "rtf"],
+    extensions: ["md", "mdx", "txt", "org", "pdf", "doc", "docx", "docm", "odt", "rtf", "epub", "mobi"],
   },
   {
     id: "presentations",
-    extensions: ["pptx", "odp"],
+    extensions: ["ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm", "odp"],
   },
   {
     id: "spreadsheets",
-    extensions: ["xls", "xlsx", "ods", "csv"],
+    extensions: ["xls", "xlsx", "xlsm", "xlsb", "ods", "csv"],
   },
   {
     id: "web",
@@ -25,7 +26,16 @@ export const SOURCE_WATCH_FILE_TYPE_GROUPS = [
     id: "data",
     extensions: ["json", "yaml", "yml", "xml"],
   },
+  {
+    id: "images",
+    extensions: ["png", "jpg", "jpeg"],
+  },
 ]
+
+const SOURCE_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg"] as const
+const LEGACY_DEFAULT_INCLUDE_EXTENSIONS = sourceWatchDefaults.includeExtensions.filter(
+  (extension) => !SOURCE_IMAGE_EXTENSIONS.includes(extension as typeof SOURCE_IMAGE_EXTENSIONS[number]),
+)
 
 function normalizeExtensions(values: readonly string[] | undefined): string[] {
   return [...new Set((values ?? [])
@@ -42,10 +52,31 @@ function normalizeList(values: readonly string[] | undefined): string[] {
 }
 
 export function normalizeSourceWatchConfig(config?: Partial<SourceWatchConfig> | null): SourceWatchConfig {
+  const rawParsingConcurrency = config?.parsingConcurrency
+    ?? DEFAULT_SOURCE_WATCH_CONFIG.parsingConcurrency
+  const parsingConcurrency = Number.isFinite(rawParsingConcurrency)
+    ? clampUserConcurrency(rawParsingConcurrency)
+    : DEFAULT_SOURCE_WATCH_CONFIG.parsingConcurrency
+  const rawIngestConcurrency = config?.ingestConcurrency
+    ?? DEFAULT_SOURCE_WATCH_CONFIG.ingestConcurrency
+  const ingestConcurrency = Number.isFinite(rawIngestConcurrency)
+    ? clampUserConcurrency(rawIngestConcurrency)
+    : DEFAULT_SOURCE_WATCH_CONFIG.ingestConcurrency
+  const includeExtensions = normalizeExtensions(
+    config?.includeExtensions ?? DEFAULT_SOURCE_WATCH_CONFIG.includeExtensions,
+  )
+  const usesLegacyDefaults = includeExtensions.length === LEGACY_DEFAULT_INCLUDE_EXTENSIONS.length
+    && LEGACY_DEFAULT_INCLUDE_EXTENSIONS.every((extension) => includeExtensions.includes(extension))
   return {
     enabled: config?.enabled ?? DEFAULT_SOURCE_WATCH_CONFIG.enabled,
     autoIngest: config?.autoIngest ?? DEFAULT_SOURCE_WATCH_CONFIG.autoIngest,
-    includeExtensions: normalizeExtensions(config?.includeExtensions ?? DEFAULT_SOURCE_WATCH_CONFIG.includeExtensions),
+    persistExtractedMarkdown:
+      config?.persistExtractedMarkdown ?? DEFAULT_SOURCE_WATCH_CONFIG.persistExtractedMarkdown,
+    parsingConcurrency,
+    ingestConcurrency,
+    includeExtensions: usesLegacyDefaults
+      ? [...includeExtensions, ...SOURCE_IMAGE_EXTENSIONS]
+      : includeExtensions,
     excludeExtensions: normalizeExtensions(config?.excludeExtensions ?? DEFAULT_SOURCE_WATCH_CONFIG.excludeExtensions),
     excludeDirs: normalizeList(config?.excludeDirs ?? DEFAULT_SOURCE_WATCH_CONFIG.excludeDirs),
     excludeGlobs: normalizeList(config?.excludeGlobs ?? DEFAULT_SOURCE_WATCH_CONFIG.excludeGlobs),

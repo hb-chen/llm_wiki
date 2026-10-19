@@ -1,6 +1,7 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
-import { readFile, listDirectory } from "@/commands/fs"
+import { readFile } from "@/commands/fs"
 import {
+  invalidateProjectFileSnapshotPaths,
   rescanProjectFiles,
   startProjectFileWatcher,
   stopProjectFileWatcher,
@@ -8,7 +9,8 @@ import {
 } from "@/commands/file-sync"
 import { useFileSyncStore } from "@/stores/file-sync-store"
 import { useWikiStore } from "@/stores/wiki-store"
-import { getFileStem, normalizePath } from "@/lib/path-utils"
+import { normalizePath } from "@/lib/path-utils"
+import { wikiPageIdFromPath } from "@/lib/embedding"
 import type { WikiProject } from "@/types/wiki"
 import type { SourceWatchConfig } from "@/stores/wiki-store"
 import type { FileChangeTask } from "@/commands/file-sync"
@@ -16,9 +18,17 @@ import {
   cleanupDeletedWikiPages,
   deleteSourceFiles,
   enqueueSourceIngest,
+  folderContextForSourcePath,
   isIngestableSourcePath,
+  migrateSourcePath,
 } from "@/lib/source-lifecycle"
+import {
+  discardInactiveProjectTasksForSources,
+  enqueueInactiveProjectBatch,
+} from "@/lib/ingest-queue"
 import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
+import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { getRecentProjects, loadSourceWatchConfig } from "@/lib/project-store"
 
 let unlistenQueue: UnlistenFn | null = null
 let unlistenChanged: UnlistenFn | null = null
@@ -28,6 +38,11 @@ let pendingRefreshPaths = new Set<string>()
 let pendingChangeTasks = new Map<string, FileChangeTask>()
 let activeSourceWatchConfig = normalizeSourceWatchConfig()
 let handledChangeTaskKeys = new Set<string>()
+let allProjectsTimer: ReturnType<typeof setInterval> | null = null
+let allProjectsRunId = 0
+let allProjectsScanning = false
+let allProjectsActiveProject: WikiProject | null = null
+const ALL_PROJECTS_SCAN_INTERVAL_MS = 60_000
 
 export async function startProjectFileSync(
   project: WikiProject,
@@ -105,6 +120,66 @@ export async function stopProjectFileSync(): Promise<void> {
   }
 }
 
+export function startAllProjectFileSync(activeProject: WikiProject): void {
+  stopAllProjectFileSync()
+  allProjectsActiveProject = activeProject
+  const runId = ++allProjectsRunId
+  void scanInactiveProjects(activeProject, runId)
+  allProjectsTimer = setInterval(() => {
+    void scanInactiveProjects(activeProject, runId)
+  }, ALL_PROJECTS_SCAN_INTERVAL_MS)
+}
+
+export function stopAllProjectFileSync(): void {
+  allProjectsRunId += 1
+  allProjectsActiveProject = null
+  if (allProjectsTimer) {
+    clearInterval(allProjectsTimer)
+    allProjectsTimer = null
+  }
+}
+
+async function scanInactiveProjects(activeProject: WikiProject, runId: number): Promise<void> {
+  if (allProjectsScanning || runId !== allProjectsRunId) return
+  allProjectsScanning = true
+  try {
+    const recents = await getRecentProjects()
+    const seen = new Set<string>([activeProject.id])
+    const seenPaths = new Set<string>([normalizePath(activeProject.path)])
+    for (const project of recents) {
+      if (runId !== allProjectsRunId) return
+      const projectPath = normalizePath(project.path)
+      if (seen.has(project.id) || seenPaths.has(projectPath)) continue
+      seen.add(project.id)
+      seenPaths.add(projectPath)
+      try {
+        const config = normalizeSourceWatchConfig(await loadSourceWatchConfig(project.id))
+        if (!config.enabled) continue
+        const result = await rescanProjectFiles(
+          project.id,
+          projectPath,
+          config,
+          true,
+        )
+        if (runId !== allProjectsRunId) return
+        if (result.changedTasks.length > 0) {
+          const paths = [...new Set(result.changedTasks.map((task) => task.path))]
+          await processFileChangeBatch(project, paths, result.changedTasks, config, false)
+        }
+      } catch (err) {
+        console.warn(`[file-sync] failed to scan inactive project ${project.path}:`, err)
+      }
+    }
+  } finally {
+    allProjectsScanning = false
+    const latestProject = allProjectsActiveProject
+    const latestRunId = allProjectsRunId
+    if (runId !== latestRunId && latestProject && allProjectsTimer) {
+      void scanInactiveProjects(latestProject, latestRunId)
+    }
+  }
+}
+
 export async function rescanProjectFileSync(
   project: WikiProject,
   sourceWatchConfig?: SourceWatchConfig,
@@ -169,6 +244,8 @@ async function processFileChangeBatch(
   project: WikiProject,
   paths: string[],
   tasks: FileChangeTask[],
+  sourceWatchConfig: SourceWatchConfig = activeSourceWatchConfig,
+  refreshActiveProject = true,
 ): Promise<void> {
   for (const task of tasks) {
     handledChangeTaskKeys.add(changeTaskKey(task))
@@ -176,22 +253,71 @@ async function processFileChangeBatch(
   if (handledChangeTaskKeys.size > 4096) {
     handledChangeTaskKeys = new Set([...handledChangeTaskKeys].slice(-2048))
   }
-  await cleanupDeletedFiles(project, tasks)
-  await enqueueRawSourceChanges(project, tasks)
-  await refreshAfterFileChanges(project, paths)
+  if (!refreshActiveProject) {
+    const deletedSources = tasks
+      .filter((task) => task.kind === "deleted" && isRawSourcePathForCascade(task.path))
+      .map((task) => task.path)
+    await discardInactiveProjectTasksForSources(project.id, project.path, deletedSources)
+  }
+  const movedTaskIds = await migrateUnchangedSourceMoves(project, tasks)
+  const remainingTasks = tasks.filter((task) => !movedTaskIds.has(task.id))
+  await cleanupDeletedFiles(project, remainingTasks)
+  await enqueueRawSourceChanges(project, remainingTasks, sourceWatchConfig, refreshActiveProject)
+  if (refreshActiveProject) await refreshAfterFileChanges(project, paths)
+}
+
+async function migrateUnchangedSourceMoves(
+  project: WikiProject,
+  tasks: FileChangeTask[],
+): Promise<Set<string>> {
+  const moved = new Set<string>()
+  const createdByHash = new Map<string, FileChangeTask[]>()
+  const deletedByHash = new Map<string, FileChangeTask[]>()
+  for (const task of tasks) {
+    if (!isRawSourcePathForCascade(task.path)) continue
+    if (task.kind === "created" && task.hashAfter && (task.size ?? 0) >= 32) {
+      const matches = createdByHash.get(task.hashAfter) ?? []
+      matches.push(task)
+      createdByHash.set(task.hashAfter, matches)
+    } else if (task.kind === "deleted" && task.hashBefore && (task.size ?? 0) >= 32) {
+      const matches = deletedByHash.get(task.hashBefore) ?? []
+      matches.push(task)
+      deletedByHash.set(task.hashBefore, matches)
+    }
+  }
+
+  for (const [hash, deletedMatches] of deletedByHash) {
+    const createdMatches = createdByHash.get(hash)
+    // Content identity only proves a move when both sides are unique.
+    if (deletedMatches.length !== 1 || createdMatches?.length !== 1) continue
+    const deleted = deletedMatches[0]
+    const created = createdMatches[0]
+    try {
+      await migrateSourcePath(project.path, deleted.path, created.path)
+      moved.add(deleted.id)
+      moved.add(created.id)
+    } catch (err) {
+      console.error("[file-sync] failed to migrate unchanged source move:", err)
+      // The hash pair still proves this is a move. Suppress destructive
+      // delete/create fallback after a transactional migration rollback;
+      // surface the failure so the user can retry with a manual rescan.
+      moved.add(deleted.id)
+      moved.add(created.id)
+      useFileSyncStore.getState().setLastError(
+        `Failed to migrate moved source metadata: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+  return moved
 }
 
 async function refreshAfterFileChanges(project: WikiProject, relativePaths: string[]): Promise<void> {
   const pp = normalizePath(project.path)
   const store = useWikiStore.getState()
-  try {
-    const tree = await listDirectory(pp)
-    useWikiStore.getState().setFileTree(tree)
-  } catch (err) {
-    console.warn("[file-sync] failed to refresh file tree:", err)
-  }
-
-  store.bumpDataVersion()
+  await refreshProjectFileTree(pp, {
+    projectId: project.id,
+    bumpDataVersion: true,
+  })
 
   const selected = store.selectedFile ? normalizePath(store.selectedFile) : null
   if (!selected) return
@@ -208,8 +334,13 @@ async function refreshAfterFileChanges(project: WikiProject, relativePaths: stri
   }
 }
 
-async function enqueueRawSourceChanges(project: WikiProject, tasks: FileChangeTask[]): Promise<void> {
-  const config = normalizeSourceWatchConfig(activeSourceWatchConfig)
+async function enqueueRawSourceChanges(
+  project: WikiProject,
+  tasks: FileChangeTask[],
+  sourceWatchConfig: SourceWatchConfig,
+  activeProject: boolean,
+): Promise<void> {
+  const config = normalizeSourceWatchConfig(sourceWatchConfig)
   if (!config.enabled || !config.autoIngest) return
 
   const candidates = tasks
@@ -223,9 +354,29 @@ async function enqueueRawSourceChanges(project: WikiProject, tasks: FileChangeTa
   if (paths.length === 0) return
 
   try {
-    await enqueueSourceIngest(project, paths, useWikiStore.getState().llmConfig)
+    if (activeProject) {
+      await enqueueSourceIngest(project, paths, useWikiStore.getState().llmConfig, {
+        parsingConcurrency: config.parsingConcurrency,
+      })
+    } else {
+      await enqueueInactiveProjectBatch(
+        project.id,
+        project.path,
+        paths.map((sourcePath) => ({
+          sourcePath,
+          folderContext: folderContextForSourcePath(sourcePath),
+        })),
+      )
+    }
   } catch (err) {
     console.error("[file-sync] failed to enqueue raw source ingest:", err)
+    if (!activeProject) {
+      try {
+        await invalidateProjectFileSnapshotPaths(project.path, paths)
+      } catch (invalidateErr) {
+        console.error("[file-sync] failed to schedule background ingest retry:", invalidateErr)
+      }
+    }
   }
 }
 
@@ -245,20 +396,24 @@ async function cleanupDeletedFiles(project: WikiProject, tasks: FileChangeTask[]
   const rawSources = deleted.filter(isRawSourcePathForCascade)
   const wikiPages = deleted.filter(isWikiPageForCascade)
 
-  let deletedWikiSlugs = new Set<string>()
+  let deletedWikiIds = new Set<string>()
   if (rawSources.length > 0) {
     try {
       const result = await deleteSourceFiles(project.path, rawSources, {
         fileAlreadyDeleted: true,
         logReason: rawSources.length === 1 ? "external delete" : "external batch delete",
       })
-      deletedWikiSlugs = new Set(result.deletedWikiPaths.map((path) => getFileStem(path)))
+      deletedWikiIds = new Set(
+        result.deletedWikiPaths.map((path) => wikiPageIdFromPath(project.path, path)),
+      )
     } catch (err) {
       console.error("[file-sync] failed to clean deleted raw sources:", err)
     }
   }
 
-  const wikiPagesToClean = wikiPages.filter((path) => !deletedWikiSlugs.has(getFileStem(path)))
+  const wikiPagesToClean = wikiPages.filter(
+    (path) => !deletedWikiIds.has(wikiPageIdFromPath(project.path, path)),
+  )
   if (wikiPagesToClean.length > 0) {
     try {
       await cleanupDeletedWikiPages(project.path, wikiPagesToClean)

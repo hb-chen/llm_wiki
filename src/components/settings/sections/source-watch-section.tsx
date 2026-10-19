@@ -6,6 +6,7 @@ import {
   normalizeSourceWatchConfig,
   SOURCE_WATCH_FILE_TYPE_GROUPS,
 } from "@/lib/source-watch-config"
+import { MAX_USER_CONCURRENCY } from "@/lib/concurrency-limits"
 
 interface Props {
   draft: SettingsDraft
@@ -101,6 +102,97 @@ export function SourceWatchSection({ draft, setDraft, projectReady }: Props) {
               {t("settings.sections.sourceWatch.enableDescription", {
                 defaultValue:
                   "Refreshes the Sources view and indexes allowed new or modified files under raw/sources.",
+              })}
+            </p>
+          </div>
+        </label>
+
+        <label className="flex items-start gap-3">
+          <input
+            type="checkbox"
+            checked={draft.sourceWatchAllProjects}
+            onChange={(event) => setDraft("sourceWatchAllProjects", event.target.checked)}
+            className="mt-1 h-4 w-4"
+          />
+          <div className="space-y-1">
+            <div className="text-sm font-semibold">
+              {t("settings.sections.sourceWatch.allProjects", {
+                defaultValue: "Monitor all recent projects",
+              })}
+            </div>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {t("settings.sections.sourceWatch.allProjectsDescription", {
+                defaultValue:
+                  "Keep watching source folders for every recent project that has monitoring enabled. Background changes are queued for that project and run when it is opened.",
+              })}
+            </p>
+          </div>
+        </label>
+
+        <label className="block space-y-1.5">
+          <span className="text-sm font-semibold">
+            {t("settings.sections.sourceWatch.parsingConcurrency", {
+              defaultValue: "Concurrent document parsers",
+            })}
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={MAX_USER_CONCURRENCY}
+            value={config.parsingConcurrency}
+            onChange={(event) => updateConfig({ parsingConcurrency: Number(event.target.value) || 1 })}
+            disabled={!projectReady}
+            className="w-24 rounded-md border border-input bg-background px-2 py-1 text-sm"
+          />
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            {t("settings.sections.sourceWatch.parsingConcurrencyDescription", {
+              defaultValue:
+                "Parse up to this many imported documents at once. PDF parsing remains internally serialized for safety.",
+            })}
+          </p>
+        </label>
+
+        <label className="block space-y-1.5">
+          <span className="text-sm font-semibold">
+            {t("settings.sections.sourceWatch.ingestConcurrency", {
+              defaultValue: "Concurrent ingest tasks",
+            })}
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={MAX_USER_CONCURRENCY}
+            value={config.ingestConcurrency}
+            onChange={(event) => updateConfig({ ingestConcurrency: Number(event.target.value) || 1 })}
+            disabled={!projectReady}
+            className="w-24 rounded-md border border-input bg-background px-2 py-1 text-sm"
+          />
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            {t("settings.sections.sourceWatch.ingestConcurrencyDescription", {
+              defaultValue:
+                "Prepare this many sources in parallel. Wiki writes remain ordered. Higher values use more LLM capacity and memory.",
+            })}
+          </p>
+        </label>
+
+        <label className="flex items-start gap-3">
+          <input
+            type="checkbox"
+            checked={config.persistExtractedMarkdown}
+            onChange={(event) => updateConfig({ persistExtractedMarkdown: event.target.checked })}
+            disabled={!projectReady}
+            className="mt-1 h-4 w-4"
+          />
+          <div className="space-y-1">
+            <span className="text-sm font-semibold">
+              {t("settings.sections.sourceWatch.persistExtractedMarkdown", {
+                defaultValue: "Keep parsed Markdown",
+              })}
+            </span>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {t("settings.sections.sourceWatch.persistExtractedMarkdownDescription", {
+                defaultValue:
+                  "Save extracted document text under raw/parsed using the same folder structure as raw/sources.",
               })}
             </p>
           </div>
